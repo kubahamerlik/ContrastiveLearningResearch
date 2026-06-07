@@ -1,0 +1,55 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+ENV/
+
+# --- Datasety (pobierane automatycznie przez datasets.py) ---
+# Bardzo duże, nie wrzucamy do repo. Każde uruchomienie pobiera ponownie.
+data/
+
+# --- Wygenerowane podziały (per seed, deterministyczne ze stratyfikacji) ---
+# Pliki te są reprodukowalne z kodu, więc zbędne w repo.
+splits/
+
+# --- Wyniki eksperymentów ---
+# Zostawiamy do uznania użytkownika – wyniki zwykle warto trzymać osobno.
+# Odkomentuj jeśli nie chcesz commitować surowych liczb:
+# results_*.json
+
+# --- Optuna ---
+*.optuna.db
+optuna_*.db
+
+# --- IDE ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- OS ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Logi ---
+*.log
+logs/
+
+# --- Plany Claude Code ---
+.claude/
