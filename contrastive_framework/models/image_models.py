@@ -251,6 +251,11 @@ class MoCoModel(BaseContrastiveModel):
 
         return F.cross_entropy(logits, labels)
 
+    def post_optimizer_step(self, step: int, total: int) -> None:
+        """MoCo wykonuje momentum update wewnątrz pretrain_step (przed encoder_k forward).
+        post_optimizer_step jest no-op — zapobiega podwójnemu updateowi przez pętlę.
+        """
+
     def pretrain_step(
         self, batch: Tuple[torch.Tensor, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
@@ -416,6 +421,11 @@ class BYOLModel(BaseContrastiveModel):
         for o, t in zip(self.projector.parameters(), self.projector_t.parameters()):
             t.data = t.data * self.momentum + o.data * (1.0 - self.momentum)
 
+    def post_optimizer_step(self, step: int, total: int) -> None:
+        """Cosine τ schedule + EMA update sieci target. Wywoływane po optimizer.step()."""
+        self.update_momentum(step, total)
+        self._ema_update()
+
     @staticmethod
     def _regression_loss(p: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
         """
@@ -496,8 +506,5 @@ class BYOLModel(BaseContrastiveModel):
                     RuntimeWarning,
                     stacklevel=2,
                 )
-
-        # 4. EMA update (parametry; bufory BN aktualizowane przez forward powyżej)
-        self._ema_update()
 
         return {"loss": loss, "emb_std": torch.tensor(emb_std)}

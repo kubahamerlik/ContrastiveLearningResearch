@@ -372,6 +372,14 @@ class BaseContrastiveModel(ABC, nn.Module):
             param.requires_grad = True
         self._encoder_frozen = False
 
+    def post_optimizer_step(self, step: int, total: int) -> None:
+        """
+        Wywoływane przez pętlę treningową po optimizer.step().
+        Domyślna implementacja nie robi nic.
+        Algorytmy z siecią target (MoCo, BYOL) nadpisują tę metodę
+        wykonując tu EMA/momentum update (i tylko tu — nie w pretrain_step).
+        """
+
     def get_embedding_dim(self) -> int:
         """Zwraca wymiarowość embeddings kodera (wejście klasyfikatora)."""
         return self.classifier.in_features

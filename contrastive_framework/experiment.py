@@ -293,13 +293,9 @@ def pretrain(
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
-                # EMA/momentum update MUSI być po optimizer.step() — zgodnie z He 2020, Grill 2020
-                if hasattr(model, "update_momentum"):
-                    model.update_momentum(global_step, total_steps)
-                if hasattr(model, "_momentum_update"):
-                    model._momentum_update()
-                elif hasattr(model, "_ema_update"):
-                    model._ema_update()
+                # EMA/momentum update — delegowane do modelu (post_optimizer_step).
+                # MoCo: no-op (update już w pretrain_step). BYOL: τ schedule + EMA.
+                model.post_optimizer_step(global_step, total_steps)
             batch_losses.append(loss.item())
             global_step += 1
 

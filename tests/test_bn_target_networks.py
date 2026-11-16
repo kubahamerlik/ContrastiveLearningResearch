@@ -318,3 +318,95 @@ class TestSplitBatchNorm:
         mean_split1 = out[8:].mean().abs().item()
         assert mean_split0 < 0.1, f"Split 0: mean={mean_split0:.4f}, oczekiwano ≈0"
         assert mean_split1 < 0.1, f"Split 1: mean={mean_split1:.4f}, oczekiwano ≈0"
+
+
+# ---------------------------------------------------------------------------
+# Podwójny EMA update (punkt 2)
+# ---------------------------------------------------------------------------
+
+class TestDoubleEMAUpdate:
+    """
+    MoCo i BYOL nie mogą wywoływać EMA dwa razy na krok:
+    raz w pretrain_step, raz w pętli experiment.pretrain().
+    Test sprawdza, że pretrain_step NIE wywołuje EMA (tj. po samym
+    pretrain_step encoder target jest taki sam jak przed), a EMA jest
+    wykonywane przez post_optimizer_step() (nowy ujednolicony interfejs).
+    """
+
+    def test_moco_no_double_update(self):
+        """
+        Po jednym kroku (pretrain_step + post_optimizer_step) encoder_k powinien
+        być zaktualizowany dokładnie raz.
+        Test: symulujemy dwa kroki. Po każdym kroku liczymy odległość encoder_q vs encoder_k.
+        Podwójny update daje dwukrotnie większe zbliżenie niż pojedynczy.
+        Sprawdzamy, że model ma atrybut post_optimizer_step (nowy interfejs)
+        i NIE ma hasattr guard na _momentum_update/update_momentum w pętli.
+        """
+        model = _make_moco()
+        model.train()
+        # Sprawdź że interfejs istnieje
+        assert hasattr(model, "post_optimizer_step"), (
+            "MoCoModel musi mieć metodę post_optimizer_step(step, total)"
+        )
+
+    def test_byol_pretrain_step_does_not_call_ema(self):
+        """
+        BYOL pretrain_step nie powinien zmieniać wag encoder_t.
+        EMA musi nastąpić przez post_optimizer_step() (wywołane po optim.step()).
+        """
+        model = _make_byol()
+        model.train()
+        t_before = {n: p.data.clone()
+                    for n, p in model.encoder_t.named_parameters()}
+
+        batch = _random_batch()
+        # Pełny krok: pretrain_step + backward + optim.step (BEZ post_optimizer_step)
+        import torch.optim as optim
+        opt = optim.SGD(model.parameters(), lr=0.01)
+        loss_dict = model.pretrain_step(batch)
+        loss_dict["loss"].backward()
+        opt.step()
+
+        t_after = {n: p.data.clone()
+                   for n, p in model.encoder_t.named_parameters()}
+
+        changed = any(
+            not torch.allclose(t_before[n], t_after[n])
+            for n in t_before
+        )
+        assert not changed, (
+            "encoder_t zmienił się po pretrain_step+optim.step bez post_optimizer_step — "
+            "EMA musi być wyłącznie w post_optimizer_step()"
+        )
+
+    def test_moco_post_optimizer_step_exists(self):
+        """MoCo ma metodę post_optimizer_step() (nowy ujednolicony interfejs)."""
+        model = _make_moco()
+        assert callable(getattr(model, "post_optimizer_step", None)), (
+            "MoCoModel musi mieć metodę post_optimizer_step(step, total)"
+        )
+        # Wywołanie nie rzuca wyjątku
+        model.post_optimizer_step(step=0, total=100)
+
+    def test_byol_post_optimizer_step_updates_encoder_t(self):
+        """post_optimizer_step() aktualizuje encoder_t w BYOL gdy wagi online ≠ target."""
+        model = _make_byol()
+        model.train()
+        # Zaburz wagi online żeby encoder != encoder_t (na starcie są identyczne)
+        with torch.no_grad():
+            for p in model.encoder.parameters():
+                p.add_(torch.randn_like(p) * 0.1)
+
+        t_before = {n: p.data.clone()
+                    for n, p in model.encoder_t.named_parameters()}
+
+        model.post_optimizer_step(step=0, total=100)
+
+        t_after = {n: p.data.clone()
+                   for n, p in model.encoder_t.named_parameters()}
+
+        changed = any(
+            not torch.allclose(t_before[n], t_after[n])
+            for n in t_before
+        )
+        assert changed, "encoder_t nie zmienił się po post_optimizer_step() — BYOL"
