@@ -23,8 +23,11 @@ from .base import BaseContrastiveModel
 
 def weak_augmentation(x: torch.Tensor, jitter_scale_ratio: float = 1.1) -> torch.Tensor:
     """
-    Słaba augmentacja: skalowanie per kanał per czas (Eldele 2021 Sec. 4.1).
-    Współczynnik ~ N(2, jitter_scale_ratio), niezależnie dla każdego (B, C, T).
+    Słaba augmentacja: skalowanie per czas (Eldele 2021 Sec. 4.1).
+    Współczynnik ~ N(2, jitter_scale_ratio), kształt (B, 1, T) — broadcast po kanałach.
+
+    Port z augmentations.py scaling(): factor = np.random.normal(2., sigma, (B, T))
+    → kształt (B, T) rozgłoszony na (B, C, T) ≡ (B, 1, T).
     """
     # scale: (B, 1, T) — wspólny dla wszystkich kanałów (jak w referencji: augmentations.py).
     # Oryginalny kod: torch.from_numpy(np.random.normal(loc=2.0, scale=jitter_scale_ratio,
@@ -42,44 +45,42 @@ def strong_augmentation(
 ) -> torch.Tensor:
     """
     Silna augmentacja: permutacja(max_seg) + jitter (Eldele 2021 Sec. 4.1).
-    Port z augmentations.py – vectorized on tensor (GPU-friendly).
+
+    Port 1:1 z augmentations.py – permutation(x, max_segments, seg_mode="random"):
+      - Per-sample num_segs ∈ [1, max_seg-1] (randint(1, max_segments))
+      - num_segs=1 → próbka niezmieniona (tylko jitter na końcu)
+      - num_segs>1 → losowe punkty podziału (randint bez powtórzeń),
+        sort, np.split, losowa permutacja segmentów
+      - Jitter N(0, jitter_ratio) dodawany po permutacji (wszystkie próbki)
+
+    Pętla per-próbka jest OK dla batch=128 — operacje numpy wewnątrz.
     """
+    import numpy as np
+
     B, C, T = x.shape
+    x_np = x.detach().cpu().numpy()  # (B, C, T)
+    out_np = np.empty_like(x_np)
 
-    # --- Permutacja segmentów ---
-    # Dla każdej próbki losuj n_segs ∈ [1, max_seg-1] i podziel T na n_segs
-    # Uproszczenie wektoryzowane: wspólna liczba segmentów dla batcha,
-    # ale kolejność segmentów niezależna dla każdej próbki (jak w oryginale).
-    # n_segs per-sample (jak w referencji: augmentations.py używa size=(x.shape[0],)).
-    # Każda próbka w batchu może mieć inną liczbę segmentów.
-    n_segs_per = torch.randint(1, max_seg, size=(B,), device=x.device)  # (B,)
-    # Dla wektoryzacji używamy mediany jako wspólnego n_segs
-    # (perm_idx i tak jest per-sample). Rzeczywisty efekt per-sample jest przez perm_idx.
-    n_segs = int(n_segs_per.float().mean().round().item())
-    n_segs = max(1, min(n_segs, T))
+    orig_steps = np.arange(T)
 
-    seg_len = T // n_segs
-    if seg_len < 1 or n_segs == 1:
-        # Za krótki szereg lub 1 segment – tylko jitter
-        return x + torch.randn_like(x) * jitter_ratio
+    for i in range(B):
+        num_segs = np.random.randint(1, max_seg)
+        if num_segs > 1 and T > num_segs:
+            # Losowe punkty podziału: num_segs-1 unikalnych wartości z [0, T-2]
+            # (odpowiada np.random.choice(x.shape[2]-2, num_segs-1, replace=False) z referencji)
+            split_points = np.sort(
+                np.random.choice(T - 2, num_segs - 1, replace=False)
+            ) + 1  # +1 żeby punkty nie były na pozycji 0
+            splits = np.split(orig_steps, split_points)
+            perm = np.random.permutation(len(splits))
+            warp = np.concatenate([splits[p] for p in perm])
+            out_np[i] = x_np[i][:, warp]  # (C, T)[all channels, permuted time]
+        else:
+            out_np[i] = x_np[i]
 
-    T_perm = n_segs * seg_len  # przycinamy do wielokrotności seg_len
-
-    # (B, C, n_segs, seg_len)
-    segs = x[:, :, :T_perm].reshape(B, C, n_segs, seg_len)
-
-    # Niezależna permutacja dla każdej próbki w batchu
-    # (B, n_segs) – losowa kolejność segmentów
-    perm_idx = torch.argsort(torch.rand(B, n_segs, device=x.device), dim=1)
-    # Rozszerzamy do (B, C, n_segs, seg_len)
-    perm_idx_exp = perm_idx[:, None, :, None].expand(B, C, n_segs, seg_len)
-    segs_perm = segs.gather(dim=2, index=perm_idx_exp)
-
-    x_perm = x.clone()
-    x_perm[:, :, :T_perm] = segs_perm.reshape(B, C, T_perm)
-
-    # Jitter
-    return x_perm + torch.randn_like(x_perm) * jitter_ratio
+    result = torch.tensor(out_np, dtype=x.dtype, device=x.device)
+    # Jitter N(0, jitter_ratio) po permutacji
+    return result + torch.randn_like(result) * jitter_ratio
 
 
 # ===========================================================================

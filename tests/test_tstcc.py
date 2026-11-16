@@ -1,8 +1,10 @@
 """
 Testy dla TS-TCC (timeseries_models.py).
-Pokrywa punkty 7 i 8:
+Pokrywa punkty 7, 8 i p3:
   7. _SeqTransformer musi być wiernym portem Pre-LN z attention.py (nie Post-LN PyTorcha)
   8. weak_aug scale (B,1,T); strong_aug per-sample n_segs; Conv1d bias=False
+  p3. strong_augmentation: per-sample num_segs ∈ [1..max_seg-1]; permutacja zachowuje multiset;
+      segmenty bywają różnej długości; n_segs=1 → próbka niezmieniona (poza jitterem)
 """
 import math
 import torch
@@ -164,6 +166,90 @@ class TestStrongAugmentation:
         x = torch.randn(4, 3, 50)
         out = strong_augmentation(x)
         assert out.shape == x.shape
+
+
+class TestStrongAugmentationFaithful:
+    """p3: strong_augmentation wierna oryginałowi (augmentations.py permutation)."""
+
+    def test_many_samples_unchanged_when_p_is_high(self):
+        """Przy max_seg=3, P(n_segs=1)=1/2 → ~50% próbek niezmienione (jitter=0).
+
+        Oryginał: randint(1, 3) → {1, 2} z p=0.5 każde; n_segs=1 → próbka bez zmian.
+        Stara implementacja: mean(randint(1,3)_per_sample) ≈ 1.5 → round → 2;
+        KAŻDA próbka jest permutowana (n_segs=2), a prawdopodobieństwo tożsamej permutacji
+        przy 2 segmentach = 1/2! = 0.5. To dałoby ~50% też, więc nie jest dobrym testem.
+
+        Lepszy test: przy max_seg=10, P(n_segs=1)=1/9 ≈ 11%; stara implementacja
+        ma n_segs=round(mean(1..9))=5, P(tożsama perm)=1/5!=1/120 ≈ 0.8%.
+        Różnica: ~11% vs ~0.8% → statystycznie istotna przy B=512.
+        """
+        torch.manual_seed(0)
+        B, C, T = 512, 1, 90
+        max_seg = 10  # P(n_segs=1) = 1/9 ≈ 56 unchanged; stara: ~4 unchanged (1/120 * 512)
+        x = torch.randn(B, C, T)
+        out = strong_augmentation(x, jitter_ratio=0.0, max_seg=max_seg)
+        unchanged_count = sum(
+            1 for i in range(B) if torch.allclose(x[i], out[i], atol=1e-6)
+        )
+        # Przy per-sample n_segs: E[unchanged] ≈ 56.8 (B × 1/9)
+        # Przy mean+round (n_segs≈5): E[unchanged] ≈ 4.3 (B × 1/120)
+        # Próg 15 oddziela oba przypadki z dużym marginesem
+        assert unchanged_count >= 15, (
+            f"Tylko {unchanged_count}/{B} próbek jest niezmienione przy max_seg={max_seg}, jitter=0. "
+            f"Oryginał: P(n_segs=1)=1/9 → E≈{B//9} niezmienione. "
+            f"Stara implementacja (mean+round) daje n_segs≈5, E≈{512//120} tożsamych permutacji. "
+            f"Wynik {unchanged_count} wskazuje na brakującą implementację per-sample n_segs."
+        )
+
+    def test_permutation_preserves_multiset_before_jitter(self):
+        """Permutacja segmentów musi zachować multizbiór wartości każdej próbki.
+
+        Sprawdzamy przy jitter_ratio=0 (brak szumu): posortowane wartości przed i po
+        muszą być identyczne (zmieniona tylko kolejność, nie wartości).
+        """
+        torch.manual_seed(1)
+        B, C, T = 16, 1, 60
+        x = torch.randn(B, C, T)
+        out = strong_augmentation(x, jitter_ratio=0.0, max_seg=5)
+        for i in range(B):
+            orig_sorted = x[i].sort().values
+            out_sorted  = out[i].sort().values
+            assert torch.allclose(orig_sorted, out_sorted, atol=1e-5), (
+                f"Próbka {i}: multizbiór wartości zmienił się po permutacji. "
+                "strong_augmentation może zmieniać wartości, nie tylko kolejność."
+            )
+
+    def test_identity_when_n_segs_equals_1(self):
+        """Gdy n_segs=1, permutacja nie zmienia danych (tylko jitter może zmieniać).
+
+        Oryginał: 'if num_segs[i] > 1: ... else: ret[i] = pat'
+        Sprawdzamy przy jitter_ratio=0: próbka musi być niezmieniona.
+        """
+        torch.manual_seed(2)
+        B, C, T = 32, 1, 50
+        # max_seg=2 → num_segs ∈ {1} (randint(1,2) = zawsze 1)
+        x = torch.randn(B, C, T)
+        out = strong_augmentation(x, jitter_ratio=0.0, max_seg=2)
+        assert torch.allclose(x, out, atol=1e-6), (
+            "Gdy max_seg=2, num_segs zawsze =1. Próbki powinny być niezmienione (jitter=0)."
+        )
+
+    def test_weak_augmentation_docstring_shape(self):
+        """weak_augmentation docstring musi opisywać shape (B,1,T) a nie (B,C,T).
+
+        Sprawdzamy pośrednio: scale jest (B,1,T) — dwa kanały tej samej próbki
+        mają identyczne wartości skalowania (test z test_tstcc.py już to robi;
+        tu tylko weryfikujemy, że docstring zawiera '(B, 1, T)' lub 'B, 1, T').
+        """
+        import inspect
+        from contrastive_framework.models.timeseries_models import weak_augmentation
+        doc = inspect.getdoc(weak_augmentation) or ""
+        # Sprawdzamy że docstring NIE twierdzi tylko (B, C, T) bez wzmianki o (B,1,T)
+        # (wystarczy że nie ma fałszywego twierdzenia; szczegółowy test skali jest w TestWeakAugmentation)
+        assert "(B, C, T)" not in doc or "(B, 1, T)" in doc, (
+            f"Docstring weak_augmentation mówi '(B, C, T)' ale scale jest (B,1,T). "
+            f"Obecny docstring: {doc[:200]}"
+        )
 
 
 class TestBaseModelConv1dBias:
