@@ -9,6 +9,8 @@ Pokrycie:
 - Głowica MLP v2: bez BN (Linear → ReLU → Linear)
 - pretrain_step: loss skończony, backprop działa
 - Inicjalizacja kolejki: losowe znorm. wektory
+- p2: SplitBN w encoder_q (bn_splits>1); shuffle/unshuffle odtwarza kolejność;
+      RandomInit dla obrazów NIE ma SplitBN
 """
 
 import pytest
@@ -17,6 +19,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from contrastive_framework.models.image_models import MoCoModel, _build_moco_v2_projector
+from contrastive_framework.models.base import SplitBatchNorm2d
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -382,3 +385,91 @@ class TestPrefillQueueFlag:
             num_classes=10, queue_size=32, bn_splits=1, prefill_queue=True,
         )
         assert m.prefill_queue_enabled is True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# p2: SplitBN w obu enkoderach + single-GPU batch shuffle
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMoCoP2ShuffleBN:
+    """Punkt p2: encoder_q ma SplitBN gdy bn_splits>1; shuffle+unshuffle odtwarza kolejność."""
+
+    def _make_split_model(self):
+        return MoCoModel(
+            encoder_type="cnn_image", input_dim=3, hidden_dim=64, proj_dim=32,
+            num_classes=10, queue_size=32, momentum=0.999, temperature=0.2,
+            bn_splits=4,
+        )
+
+    def test_encoder_q_has_split_bn(self):
+        """encoder_q (self.encoder) musi zawierać SplitBatchNorm2d gdy bn_splits>1."""
+        m = self._make_split_model()
+        has_split = any(isinstance(mod, SplitBatchNorm2d) for mod in m.encoder.modules())
+        assert has_split, (
+            "encoder_q (self.encoder) nie zawiera SplitBatchNorm2d przy bn_splits>1. "
+            "Notebook CIFAR wymaga SplitBN w OBU enkoderach (q i k)."
+        )
+
+    def test_encoder_k_has_split_bn(self):
+        """encoder_k musi zawierać SplitBatchNorm2d gdy bn_splits>1 (istnieje już)."""
+        m = self._make_split_model()
+        has_split = any(isinstance(mod, SplitBatchNorm2d) for mod in m.encoder_k.modules())
+        assert has_split, "encoder_k nie zawiera SplitBatchNorm2d przy bn_splits>1"
+
+    def test_encoder_q_plain_bn_when_splits_1(self):
+        """Gdy bn_splits=1, encoder_q używa zwykłego BatchNorm2d, nie SplitBN."""
+        m = make_model(bn_splits=1)
+        has_split = any(isinstance(mod, SplitBatchNorm2d) for mod in m.encoder.modules())
+        assert not has_split, (
+            "encoder_q nie powinien mieć SplitBatchNorm2d gdy bn_splits=1"
+        )
+
+    def test_shuffle_unshuffle_restores_order(self):
+        """_batch_shuffle_single_gpu + _batch_unshuffle_single_gpu muszą odtworzyć kolejność."""
+        m = self._make_split_model()
+        torch.manual_seed(0)
+        x = torch.randn(8, 3, 16, 16)
+        x_shuffled, unshuffle_idx = m._batch_shuffle_single_gpu(x)
+        x_restored = m._batch_unshuffle_single_gpu(x_shuffled, unshuffle_idx)
+        assert torch.allclose(x, x_restored), (
+            "Po shuffle+unshuffle tensor nie jest identyczny z oryginałem. "
+            "unshuffle_idx powinien być argsort(perm)."
+        )
+
+    def test_shuffle_changes_order(self):
+        """shuffle musi rzeczywiście zmienić kolejność (z wyjątkiem trywialnych perm)."""
+        m = self._make_split_model()
+        # Z batchem 32 i losowym seed, permutacja nie będzie identyczna.
+        torch.manual_seed(42)
+        x = torch.arange(32, dtype=torch.float).reshape(32, 1, 1, 1).expand(32, 3, 1, 1).clone()
+        x_shuffled, _ = m._batch_shuffle_single_gpu(x)
+        # Przynajmniej jeden element powinien się różnić od identycznej permutacji
+        assert not torch.equal(x[:, 0, 0, 0], x_shuffled[:, 0, 0, 0]), (
+            "_batch_shuffle_single_gpu zwróciło niezmieniony tensor — permutacja tożsama?"
+        )
+
+    def test_pretrain_step_with_split_bn(self):
+        """pretrain_step działa poprawnie gdy oba enkodery mają SplitBN."""
+        m = self._make_split_model()
+        m.train()
+        x_q, x_k = fake_batch(B=4, H=16, W=16)
+        result = m.pretrain_step((x_q, x_k))
+        assert "loss" in result
+        assert torch.isfinite(result["loss"]), "Loss nie jest skończony przy SplitBN"
+
+    def test_random_init_image_no_split_bn(self):
+        """RandomInit dla obrazów NIE może mieć SplitBatchNorm2d.
+
+        RandomInitModel z encoder_type='cnn_image' (bez bn_splits) → build_encoder(bn_splits=1)
+        → zwykły BatchNorm2d. SplitBN to specyfika MoCo.
+        """
+        from contrastive_framework.baseline import RandomInitModel
+        m = RandomInitModel(
+            encoder_type="cnn_image", input_dim=3, hidden_dim=64,
+            proj_dim=32, num_classes=10,
+        )
+        has_split = any(isinstance(mod, SplitBatchNorm2d) for mod in m.modules())
+        assert not has_split, (
+            "RandomInitModel (image) nie powinien mieć SplitBatchNorm2d. "
+            "SplitBN to specyfika MoCo — RandomInit używa zwykłego BatchNorm."
+        )

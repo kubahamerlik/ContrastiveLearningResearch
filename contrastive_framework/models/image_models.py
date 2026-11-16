@@ -87,7 +87,7 @@ class MoCoModel(BaseContrastiveModel):
     momentum    : float – m w EMA (domyślnie 0.999, jak w oryginale)
     temperature : float – τ w InfoNCE (domyślnie 0.2 — wartość v2 z --moco-t 0.2)
                   MoCo v1 używa 0.07; v2 (aug-plus) używa 0.2
-    bn_splits   : int   – liczba podgrup SplitBatchNorm w encoder_k (domyślnie 8)
+    bn_splits   : int   – liczba podgrup SplitBatchNorm w encoder_q i encoder_k (domyślnie 8)
     """
 
     def __init__(
@@ -117,16 +117,21 @@ class MoCoModel(BaseContrastiveModel):
         # Port z builder.py L.31-32: Linear(dim_mlp, dim_mlp) → ReLU → Linear(dim_mlp, dim)
         self.projector = _build_moco_v2_projector(hidden_dim, proj_dim)
 
-        # encoder_k z SplitBatchNorm (bn_splits>1) — głęboka kopia encoder_q nie zadziała
-        # bo encoder_q ma zwykły BN; budujemy encoder_k od nowa z bn_splits
+        # encoder_q i encoder_k oba z SplitBatchNorm (bn_splits>1) — wg notebooka
+        # MoCo CIFAR (colab-notebook, colab/moco_cifar10_demo.ipynb): SplitBN musi być
+        # w OBU enkoderach, żeby klucze i zapytania nie mogły "rozpoznać" siebie nawzajem
+        # przez wspólne statystyki BN.
         if encoder_type == "cnn_image" and bn_splits > 1:
+            # Przebuduj encoder_q z SplitBN (nadpisz self.encoder ustawione przez super().__init__)
+            self.encoder = build_encoder(
+                encoder_type, input_dim, hidden_dim, hidden_dim, bn_splits=bn_splits
+            )
             self.encoder_k = build_encoder(
                 encoder_type, input_dim, hidden_dim, hidden_dim, bn_splits=bn_splits
             )
             # Skopiuj parametry (wagi) z encoder_q do encoder_k
             # Port z builder.py L.34-35: param_k.data.copy_(param_q.data)
-            # Bufory BN celowo nie są kopiowane — encoder_k liczy własne statystyki
-            # (odpowiednik Shuffle BN na jednej karcie)
+            # Bufory BN celowo nie są kopiowane — obie gałęzie liczą własne statystyki
             encoder_k_params = dict(self.encoder_k.named_parameters())
             for name, param in self.encoder.named_parameters():
                 if name in encoder_k_params:
@@ -185,6 +190,32 @@ class MoCoModel(BaseContrastiveModel):
         # Bufory BN (running_mean, running_var) enkoder_k aktualizują się przez
         # forward pass (train mode) — nie przez EMA. To jest właściwe: liczymy
         # statystyki batcha osobno dla gałęzi kluczy (jak Shuffle BN w oryginale).
+
+    @torch.no_grad()
+    def _batch_shuffle_single_gpu(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Tasuje batch losową permutacją i zwraca odtasowujący indeks.
+
+        Port z notebooka MoCo CIFAR (colab-notebook, colab/moco_cifar10_demo.ipynb).
+        Implementacja single-GPU zamiast DDP _batch_shuffle_ddp z builder.py.
+
+        Zwraca
+        ------
+        x_shuffled  : tensor po permutacji
+        idx_unshuffle : LongTensor kształtu (B,) odwracający permutację przez x[idx_unshuffle]
+        """
+        B = x.shape[0]
+        idx_shuffle = torch.randperm(B, device=x.device)
+        idx_unshuffle = torch.argsort(idx_shuffle)
+        return x[idx_shuffle], idx_unshuffle
+
+    @torch.no_grad()
+    def _batch_unshuffle_single_gpu(
+        self, x: torch.Tensor, idx_unshuffle: torch.Tensor
+    ) -> torch.Tensor:
+        """Odtwarza oryginalną kolejność batcha według idx_unshuffle."""
+        return x[idx_unshuffle]
 
     @torch.no_grad()
     def _dequeue_and_enqueue(self, keys: torch.Tensor) -> None:
@@ -280,9 +311,13 @@ class MoCoModel(BaseContrastiveModel):
         h_q = self.encoder(x_q)
         q = F.normalize(self.projector(h_q), dim=-1)
 
-        # 3. Gałąź kluczy — bez gradientu, ale BN w train() aktualizuje running stats
+        # 3. Gałąź kluczy — shuffle → encoder_k → unshuffle
+        # Port z notebooka MoCo CIFAR: tasowanie zapobiega "podglądaniu" statystyk batcha
+        # przez parę (q_i, k_i) w SplitBN; unshuffle przywraca kolejność przed InfoNCE.
         with torch.no_grad():
-            h_k = self.encoder_k(x_k)
+            x_k_shuffled, idx_unshuffle = self._batch_shuffle_single_gpu(x_k)
+            h_k_shuffled = self.encoder_k(x_k_shuffled)
+            h_k = self._batch_unshuffle_single_gpu(h_k_shuffled, idx_unshuffle)
             k = F.normalize(self.projector_k(h_k), dim=-1)
 
         loss = self._info_nce_loss(q, k)
