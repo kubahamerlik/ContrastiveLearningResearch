@@ -301,67 +301,78 @@ def run_one_seed(
         else:
             algo_dm = dm
 
-        if name == "RandomInit":
-            # RandomInit przechodzi HPO (finetune_lr, hidden_dim, proj_dim) —
-            # sprawiedliwe porównanie z modelami SSL. Pretrain to no-op.
-            hpo_result = optimize(
+        try:
+            if name == "RandomInit":
+                # RandomInit przechodzi HPO (finetune_lr, hidden_dim, proj_dim) —
+                # sprawiedliwe porównanie z modelami SSL. Pretrain to no-op.
+                hpo_result = optimize(
+                    model_class=model_class,
+                    data_module=algo_dm,
+                    fixed_model_kwargs=fixed_kw,
+                    n_trials=args.n_hpo_trials,
+                    pretrain_epochs=1,
+                    finetune_epochs=args.hpo_finetune_epochs,
+                    finetune_fraction=getattr(args, "hpo_label_fraction", 0.5),
+                    device=device,
+                    show_progress=True,
+                )
+                best_params = hpo_result["best_params"]
+                algo_dm.hpo_done = False
+            else:
+                hpo_result = optimize(
+                    model_class=model_class,
+                    data_module=algo_dm,
+                    fixed_model_kwargs=fixed_kw,
+                    n_trials=args.n_hpo_trials,
+                    pretrain_epochs=args.hpo_pretrain_epochs,
+                    finetune_epochs=args.hpo_finetune_epochs,
+                    finetune_fraction=getattr(args, "hpo_label_fraction", 0.5),
+                    device=device,
+                    show_progress=True,
+                )
+                best_params = hpo_result["best_params"]
+                algo_dm.hpo_done = False
+
+            model_kwargs = filter_model_kwargs(model_class, {
+                **fixed_kw,
+                "hidden_dim": best_params.get("hidden_dim", 128),
+                "proj_dim":   best_params.get("proj_dim",   64),
+                **{k: v for k, v in best_params.items()
+                   if k not in ("pretrain_lr", "finetune_lr",
+                                "hidden_dim", "proj_dim")},
+            })
+
+            result = run_experiment(
                 model_class=model_class,
+                model_kwargs=model_kwargs,
                 data_module=algo_dm,
-                fixed_model_kwargs=fixed_kw,
-                n_trials=args.n_hpo_trials,
-                pretrain_epochs=1,
-                finetune_epochs=args.hpo_finetune_epochs,
-                finetune_fraction=getattr(args, "hpo_label_fraction", 0.5),
                 device=device,
-                show_progress=True,
+                pretrain_epochs=args.pretrain_epochs,
+                finetune_epochs=args.finetune_epochs,
+                pretrain_lr=best_params.get("pretrain_lr", 3e-4),
+                finetune_lr=best_params.get("finetune_lr", 1e-3),
+                verbose=True,
+                run_finetune=getattr(args, "run_finetune", False),
+                checkpoint_dir=getattr(args, "checkpoints_dir", None),
+                checkpoint_tag=f"{args.dataset}_seed{seed}",
+                monitor_metrics=getattr(args, "monitor_metrics", False),
             )
-            best_params = hpo_result["best_params"]
-            algo_dm.hpo_done = False
-        else:
-            hpo_result = optimize(
-                model_class=model_class,
-                data_module=algo_dm,
-                fixed_model_kwargs=fixed_kw,
-                n_trials=args.n_hpo_trials,
-                pretrain_epochs=args.hpo_pretrain_epochs,
-                finetune_epochs=args.hpo_finetune_epochs,
-                finetune_fraction=getattr(args, "hpo_label_fraction", 0.5),
-                device=device,
-                show_progress=True,
-            )
-            best_params = hpo_result["best_params"]
-            algo_dm.hpo_done = False
 
-        model_kwargs = filter_model_kwargs(model_class, {
-            **fixed_kw,
-            "hidden_dim": best_params.get("hidden_dim", 128),
-            "proj_dim":   best_params.get("proj_dim",   64),
-            **{k: v for k, v in best_params.items()
-               if k not in ("pretrain_lr", "finetune_lr",
-                            "hidden_dim", "proj_dim")},
-        })
+            seed_results[name] = result["results"]
+            if result.get("results_finetune"):
+                seed_results[f"{name}_e2e"] = result["results_finetune"]
 
-        result = run_experiment(
-            model_class=model_class,
-            model_kwargs=model_kwargs,
-            data_module=algo_dm,
-            device=device,
-            pretrain_epochs=args.pretrain_epochs,
-            finetune_epochs=args.finetune_epochs,
-            pretrain_lr=best_params.get("pretrain_lr", 3e-4),
-            finetune_lr=best_params.get("finetune_lr", 1e-3),
-            verbose=True,
-            run_finetune=getattr(args, "run_finetune", False),
-            checkpoint_dir=getattr(args, "checkpoints_dir", None),
-            checkpoint_tag=f"{args.dataset}_seed{seed}",
-            monitor_metrics=getattr(args, "monitor_metrics", False),
-        )
+        except Exception as _exc:
+            # Błąd (np. NaN/Inf w BYOL) nie może zatrzymać całego seeda.
+            # Zapisujemy informację diagnostyczną i przechodzimy do kolejnego algorytmu.
+            _fail_key = f"{name}_failed"
+            seed_results[_fail_key] = {"error": str(_exc), "algo": name, "seed": seed}
+            print(f"\n  [WARN] Algorytm {name!r} (seed={seed}) zakończył się błędem: "
+                  f"{type(_exc).__name__}: {_exc}")
+            print(f"  [WARN] Wynik zapisany jako {_fail_key!r}. Kontynuuję...")
 
-        seed_results[name] = result["results"]
-        if result.get("results_finetune"):
-            seed_results[f"{name}_e2e"] = result["results_finetune"]
-
-        if getattr(args, "visualize", False) and seed == args.seeds[0]:
+        if getattr(args, "visualize", False) and seed == args.seeds[0] \
+                and f"{name}_failed" not in seed_results:
             _maybe_visualize(
                 name=name,
                 model_class=model_class,
