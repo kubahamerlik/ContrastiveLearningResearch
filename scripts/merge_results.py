@@ -95,7 +95,7 @@ def _check_consistency(files: List[Path], data: List[Dict[str, Any]]) -> None:
     # --- Te same algorytmy ---
     def _algos(d: Dict[str, Any]) -> Optional[Set[str]]:
         for seed_data in d.get("results", {}).values():
-            return set(seed_data.keys())
+            return {k for k in seed_data.keys() if not k.startswith("_")}
         return None
 
     ref_algos = _algos(data[0])
@@ -154,6 +154,8 @@ def _reconstruct_seed_results(merged: Dict[str, Any]) -> Dict[int, Dict[str, Any
         seed = int(s)
         out[seed] = {}
         for algo, frac_data in res.items():
+            if algo.startswith("_"):
+                continue
             out[seed][algo] = {float(f): m for f, m in frac_data.items()}
     return out
 

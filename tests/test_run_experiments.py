@@ -1,7 +1,7 @@
 """
-Testy dla run_experiments.py — punkt 6:
-  RuntimeError w run_experiment (np. BYOL NaN) NIE może zatrzymać całej pętli.
-  Pętla powinna zapisać informację o błędzie i kontynuować.
+Testy dla run_experiments.py — punkty 6 i p1:
+  Punkt 6: RuntimeError w run_experiment (np. BYOL NaN) NIE może zatrzymać całej pętli.
+  Punkt p1: Wpis _failures nie może psuć aggregate() ani merge_results.
 """
 import sys
 import types
@@ -21,6 +21,15 @@ _mod = importlib.util.module_from_spec(_spec)
 sys.modules["run_experiments"] = _mod
 _spec.loader.exec_module(_mod)
 run_one_seed = _mod.run_one_seed
+aggregate = _mod.aggregate
+
+_MERGE_PATH = Path(__file__).parent.parent / "scripts" / "merge_results.py"
+_mspec = importlib.util.spec_from_file_location("merge_results", _MERGE_PATH)
+_mmod = importlib.util.module_from_spec(_mspec)
+sys.modules["merge_results"] = _mmod
+_mspec.loader.exec_module(_mmod)
+_reconstruct_seed_results = _mmod._reconstruct_seed_results
+_check_consistency = _mmod._check_consistency
 
 
 # ---------------------------------------------------------------------------
@@ -159,9 +168,117 @@ class TestByolNanHandling:
             )
 
         # Funkcja NIE może rzucić wyjątku — to jest główny warunek.
-        # Powinna zapisać info o błędzie w jakiś sposób (np. klucz "BYOL_failed").
-        failed_keys = [k for k in result if "fail" in k.lower() or "error" in k.lower()]
-        assert failed_keys, (
-            "run_one_seed powinien zapisać informację o awarii algorytmu "
-            f"(np. klucz '*_failed'), ale wynik to: {list(result.keys())}"
+        # Powinna zapisać info o błędzie w _failures (lista, nie pseudo-algorytm).
+        assert "_failures" in result, (
+            "run_one_seed powinien zapisać informację o awarii w result['_failures'], "
+            f"ale wynik to: {list(result.keys())}"
         )
+        failures = result["_failures"]
+        assert len(failures) == 1, f"Oczekiwano 1 awarii, got {failures}"
+        assert failures[0]["algo"] == "BYOL"
+        assert "error" in failures[0]
+
+
+# ---------------------------------------------------------------------------
+# Punkt p1 — aggregate() i merge_results nie psuć się na _failures
+# ---------------------------------------------------------------------------
+
+class TestAggregateWithFailures:
+    """aggregate() i _reconstruct_seed_results ignorują klucze zaczynające się od '_'."""
+
+    def _make_seed_results(self, include_failure: bool = True):
+        """Tworzy słownik wyników 2 seedów, opcjonalnie z wpisem _failures."""
+        good = {
+            0.5: {"accuracy": 0.8, "macro_f1": 0.75, "balanced_acc": 0.78, "macro_auc": 0.9},
+            1.0: {"accuracy": 0.85, "macro_f1": 0.80, "balanced_acc": 0.83, "macro_auc": 0.92},
+        }
+        seed0 = {"AlgoA": good, "AlgoB": good}
+        seed1 = {"AlgoA": good, "AlgoB": good}
+        if include_failure:
+            seed0["_failures"] = [{"algo": "BYOL", "error": "NaN loss", "seed": 0}]
+        return {0: seed0, 1: seed1}
+
+    def test_aggregate_no_error_with_failures(self):
+        """aggregate() nie może rzucić wyjątku gdy seed_results zawiera '_failures'."""
+        all_seed_results = self._make_seed_results(include_failure=True)
+        result = aggregate(all_seed_results)
+        assert "AlgoA" in result
+        assert "AlgoB" in result
+
+    def test_aggregate_failures_not_in_result(self):
+        """aggregate() nie traktuje '_failures' jako algorytmu."""
+        all_seed_results = self._make_seed_results(include_failure=True)
+        result = aggregate(all_seed_results)
+        for key in result:
+            assert not key.startswith("_"), (
+                f"aggregate() zwróciło klucz zaczynający się od '_': {key!r}. "
+                "Wpisy _failures nie powinny być traktowane jako algorytmy."
+            )
+
+    def test_aggregate_without_failures_unchanged(self):
+        """Wyniki bez failures są identyczne niezależnie od tego czy failures były."""
+        with_fail = aggregate(self._make_seed_results(include_failure=True))
+        without_fail = aggregate(self._make_seed_results(include_failure=False))
+        assert set(with_fail.keys()) == set(without_fail.keys())
+        for algo in with_fail:
+            for frac in with_fail[algo]:
+                assert abs(
+                    with_fail[algo][frac]["acc_mean"] - without_fail[algo][frac]["acc_mean"]
+                ) < 1e-9
+
+    def test_reconstruct_seed_results_skips_failures(self):
+        """_reconstruct_seed_results() ignoruje '_failures' przy rekonstrukcji."""
+        merged = {
+            "results": {
+                "0": {
+                    "AlgoA": {"0.5": {"accuracy": 0.8, "macro_f1": 0.75,
+                                      "balanced_acc": 0.78, "macro_auc": 0.9}},
+                    "_failures": [{"algo": "BYOL", "error": "NaN", "seed": 0}],
+                },
+                "1": {
+                    "AlgoA": {"0.5": {"accuracy": 0.82, "macro_f1": 0.77,
+                                      "balanced_acc": 0.80, "macro_auc": 0.91}},
+                },
+            }
+        }
+        out = _reconstruct_seed_results(merged)
+        assert 0 in out
+        assert "AlgoA" in out[0]
+        for key in out[0]:
+            assert not key.startswith("_"), (
+                f"_reconstruct_seed_results zwróciło klucz '_': {key!r}"
+            )
+
+    def test_check_consistency_ignores_failures_in_algo_set(self):
+        """_check_consistency() nie liczy '_failures' jako algorytm, więc nie zgłasza
+        niezgodności gdy jeden plik ma failures a drugi nie."""
+        import argparse as _ap
+        data = [
+            {
+                "config": {"dataset": "test", "subsample": None, "batch_size": 32,
+                           "pretrain_epochs": 10, "finetune_epochs": 5,
+                           "n_hpo_trials": 5, "hpo_pretrain_epochs": 3,
+                           "hpo_finetune_epochs": 2, "hpo_label_fraction": 0.5,
+                           "splits_dir": "splits", "num_workers": 0,
+                           "correction": "holm", "run_finetune": False},
+                "results": {
+                    "0": {"AlgoA": {"0.5": {"accuracy": 0.8}},
+                          "_failures": [{"algo": "BYOL", "error": "NaN", "seed": 0}]},
+                },
+            },
+            {
+                "config": {"dataset": "test", "subsample": None, "batch_size": 32,
+                           "pretrain_epochs": 10, "finetune_epochs": 5,
+                           "n_hpo_trials": 5, "hpo_pretrain_epochs": 3,
+                           "hpo_finetune_epochs": 2, "hpo_label_fraction": 0.5,
+                           "splits_dir": "splits", "num_workers": 0,
+                           "correction": "holm", "run_finetune": False},
+                "results": {
+                    "1": {"AlgoA": {"0.5": {"accuracy": 0.82}}},
+                },
+            },
+        ]
+        from pathlib import Path as _P
+        files = [_P("gpu0.json"), _P("gpu1.json")]
+        # Nie powinno rzucić SystemExit
+        _check_consistency(files, data)

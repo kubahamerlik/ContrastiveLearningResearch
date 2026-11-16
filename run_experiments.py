@@ -364,15 +364,17 @@ def run_one_seed(
 
         except Exception as _exc:
             # Błąd (np. NaN/Inf w BYOL) nie może zatrzymać całego seeda.
-            # Zapisujemy informację diagnostyczną i przechodzimy do kolejnego algorytmu.
-            _fail_key = f"{name}_failed"
-            seed_results[_fail_key] = {"error": str(_exc), "algo": name, "seed": seed}
+            # Zapisujemy informację diagnostyczną na liście _failures — NIE jako
+            # pseudo-algorytm, bo klucz str psuje aggregate().
+            seed_results.setdefault("_failures", []).append(
+                {"error": str(_exc), "algo": name, "seed": seed}
+            )
             print(f"\n  [WARN] Algorytm {name!r} (seed={seed}) zakończył się błędem: "
                   f"{type(_exc).__name__}: {_exc}")
-            print(f"  [WARN] Wynik zapisany jako {_fail_key!r}. Kontynuuję...")
+            print(f"  [WARN] Awaria zapisana w _failures. Kontynuuję...")
 
         if getattr(args, "visualize", False) and seed == args.seeds[0] \
-                and f"{name}_failed" not in seed_results:
+                and name not in seed_results:
             _maybe_visualize(
                 name=name,
                 model_class=model_class,
@@ -398,6 +400,8 @@ def aggregate(
     raw: Dict[str, Dict[float, Dict[str, List[float]]]] = {}
     for seed_res in all_seed_results.values():
         for algo, frac_results in seed_res.items():
+            if algo.startswith("_"):
+                continue
             raw.setdefault(algo, {})
             for frac, metrics in frac_results.items():
                 raw[algo].setdefault(frac, {
@@ -772,7 +776,11 @@ def _merge_seed_result(
     s_key = str(seed)
     existing_results.setdefault(s_key, {})
     for algo, frac_data in seed_res.items():
-        existing_results[s_key][algo] = {str(f): m for f, m in frac_data.items()}
+        if algo.startswith("_"):
+            # _failures is a list — persist as-is, don't convert through frac dict
+            existing_results[s_key][algo] = frac_data
+        else:
+            existing_results[s_key][algo] = {str(f): m for f, m in frac_data.items()}
     return {"config": vars(args), "results": existing_results}
 
 
@@ -879,13 +887,23 @@ def main() -> None:
         print("\nBrak seedów do uruchomienia.")
         all_seed_results = {
             int(s): {
-                algo: {float(f): m for f, m in frac_data.items()}
+                algo: (frac_data if algo.startswith("_") else {float(f): m for f, m in frac_data.items()})
                 for algo, frac_data in res.items()
             }
             for s, res in existing_data.get("results", {}).items()
         }
 
     print(f"\nSurowe wyniki zapisane/scalone → {results_file}")
+
+    all_failures = [
+        f
+        for seed_res in all_seed_results.values()
+        for f in seed_res.get("_failures", [])
+    ]
+    if all_failures:
+        print(f"\n[AWARIE] {len(all_failures)} algorytm(ów) zakończyło się błędem:")
+        for f in all_failures:
+            print(f"  seed={f['seed']}  algo={f['algo']}  error={f['error']}")
 
     aggregated   = aggregate(all_seed_results)
     significance = wilcoxon_vs_baseline(
