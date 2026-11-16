@@ -1030,7 +1030,6 @@ def main() -> None:
             else:
                 X_seed, y_seed = X_full, y_full
 
-            from contrastive_framework.data_module import DataModuleConfig
             splits_dir = Path(args.splits_dir)
             splits_dir.mkdir(exist_ok=True, parents=True)
             split_file = splits_dir / f"{args.dataset}_seed_{seed}.json"
