@@ -2,7 +2,7 @@
 
 Framework badawczy do porównywania metod **samo-nadzorowanego uczenia kontrastowego** (SSL) z baseline'em `RandomInit` na trzech modalnościach: szeregach czasowych, danych tabelarycznych i obrazach medycznych.
 
-Praca inżynierska – pełna pętla badawcza z HPO (Optuna), 10 seedami, stratyfikowanymi splitami, early stopping, LR schedulerem (warmup + cosine) i testem statystycznym Wilcoxona.
+Praca inżynierska – pełna pętla badawcza z HPO (Optuna), 10 seedami, stratyfikowanymi splitami, early stopping, LR schedulerem (warmup + cosine) oraz statystyką 4 metryk (mean ± std ± 95% CI, różnice sparowane po seedzie).
 
 ---
 
@@ -36,9 +36,9 @@ Praca inżynierska – pełna pętla badawcza z HPO (Optuna), 10 seedami, straty
 2. **Zamrożenie kodera** – enkoder pozostaje w trybie `eval()` przez cały fine-tuning (BN running stats się nie aktualizują).
 3. **Liniowa ewaluacja** na kolejnych frakcjach etykiet: 6.25%, 12.5%, 25%, 50%, 100% – z early stopping na zbiorze val.
 4. **Ewaluacja** na ukrytym zbiorze test – 4 metryki: Accuracy, Macro F1, Balanced Accuracy, Macro AUC-ROC.
-5. Powtórz dla `N` seedów (domyślnie 10) → **mean ± std**.
-6. **Test Wilcoxona** (jednostronny na macro_f1) vs `RandomInit` → istotność statystyczna.
-7. **Tabela LaTeX** gotowa do wklejenia.
+5. Powtórz dla `N` seedów (domyślnie 10) → **mean ± std ± 95% CI t-Studenta**.
+6. **Różnice sparowane** (SSL − baseline, parowane po seedzie) dla każdej metryki: mean\_diff, std, 95% CI, wins/N. Opcjonalnie: test Wilcoxona (`--wilcoxon`).
+7. **Tabela LaTeX** i wykresy label-efficiency gotowe do wklejenia (`scripts/summarize_results.py`).
 
 Opcjonalnie: **fine-tuning end-to-end** (`--run-finetune`) obok linear probe.
 

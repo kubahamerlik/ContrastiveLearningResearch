@@ -683,7 +683,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--subsample", type=int, default=None,
                    help="Stratyfikowany subsample N próbek (None = pełny dataset)")
     p.add_argument("--seeds", type=int, nargs="+", default=list(range(10)),
-                   help="Lista seedów (domyślnie: 0..9; min. 10 dla mocy Wilcoxona)")
+                   help="Lista seedów (domyślnie: 0..9; liczba seedów zapisywana w config.seeds pliku wyników)")
     p.add_argument("--n-hpo-trials", type=int, default=20)
     p.add_argument("--pretrain-epochs",      type=int, default=100)
     p.add_argument("--finetune-epochs",      type=int, default=50)
