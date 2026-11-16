@@ -98,7 +98,7 @@ python run_experiments.py --dataset credit_card --seeds 0 \
 
 python run_experiments.py --dataset pathmnist --seeds 0 \
     --subsample 2000 --n-hpo-trials 2 \
-    --pretrain-epochs 3 --finetune-epochs 3
+    --pretrain-epochs 3 --finetune-epochs 3 --num-workers 2
 ```
 
 Po zakończeniu zobaczysz:
@@ -123,9 +123,9 @@ python run_experiments.py --dataset uci_har
 python run_experiments.py --dataset credit_card --subsample 30000
 ```
 
-**PathMNIST** – z 20k podsamplem stratyfikowanym (9 klas):
+**PathMNIST** – z 20k podsamplem stratyfikowanym (9 klas); `--num-workers 2` przyspiesza ładowanie obrazów na Kaggle/GPU:
 ```bash
-python run_experiments.py --dataset pathmnist --subsample 20000
+python run_experiments.py --dataset pathmnist --subsample 20000 --num-workers 2
 ```
 
 **Pełen dataset bez subsamplingu** (wymaga GPU; CC Fraud = 284 807 wierszy, PathMNIST = 107 180 obrazów):

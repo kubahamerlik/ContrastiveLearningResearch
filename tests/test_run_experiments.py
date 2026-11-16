@@ -125,7 +125,7 @@ class TestByolNanHandling:
              patch.object(_mod, "run_experiment", side_effect=_run_dispatch), \
              patch.object(_mod, "filter_model_kwargs", side_effect=lambda cls, kw: kw):
 
-            result = run_one_seed(
+            result, _timing, _losses = run_one_seed(
                 seed=0,
                 X=MagicMock(),
                 y=MagicMock(),
@@ -157,7 +157,7 @@ class TestByolNanHandling:
                           side_effect=RuntimeError("NaN loss")), \
              patch.object(_mod, "filter_model_kwargs", side_effect=lambda cls, kw: kw):
 
-            result = run_one_seed(
+            result, _timing, _losses = run_one_seed(
                 seed=0,
                 X=MagicMock(),
                 y=MagicMock(),

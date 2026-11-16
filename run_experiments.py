@@ -39,9 +39,12 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
+import sys
 import tempfile
+import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Type
+from typing import Any, Callable, Dict, List, Optional, Tuple, Type
 
 import torch
 from scipy.stats import wilcoxon, t as student_t
@@ -262,8 +265,11 @@ def run_one_seed(
     device: torch.device,
     factory_kwargs: Optional[Dict[str, Any]] = None,
     meta: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Pełna procedura dla jednego seedu: HPO (val) → finalny trening → test."""
+) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, Any]]:
+    """Pełna procedura dla jednego seedu: HPO (val) → finalny trening → test.
+
+    Zwraca (seed_results, timing_per_algo, pretrain_losses_per_algo).
+    """
     _seed_everything(seed)
 
     print(f"\n{'#'*64}")
@@ -284,6 +290,8 @@ def run_one_seed(
     print(dm.summary())
 
     seed_results: Dict[str, Any] = {}
+    timing_per_algo: Dict[str, Any] = {}
+    pretrain_losses_per_algo: Dict[str, Any] = {}
 
     for algo in algorithms:
         name        = algo["name"]
@@ -309,6 +317,7 @@ def run_one_seed(
             algo_dm = dm
 
         try:
+            _t_hpo_start = time.monotonic()
             if name == "RandomInit":
                 # RandomInit przechodzi HPO (finetune_lr, hidden_dim, proj_dim) —
                 # sprawiedliwe porównanie z modelami SSL. Pretrain to no-op.
@@ -339,6 +348,7 @@ def run_one_seed(
                 )
                 best_params = hpo_result["best_params"]
                 algo_dm.hpo_done = False
+            _t_hpo_end = time.monotonic()
 
             model_kwargs = filter_model_kwargs(model_class, {
                 **fixed_kw,
@@ -349,6 +359,7 @@ def run_one_seed(
                                 "hidden_dim", "proj_dim")},
             })
 
+            _t_pretrain_start = time.monotonic()
             result = run_experiment(
                 model_class=model_class,
                 model_kwargs=model_kwargs,
@@ -364,10 +375,21 @@ def run_one_seed(
                 checkpoint_tag=f"{args.dataset}_seed{seed}",
                 monitor_metrics=getattr(args, "monitor_metrics", False),
             )
+            _t_pretrain_end = time.monotonic()
 
             seed_results[name] = result["results"]
             if result.get("results_finetune"):
                 seed_results[f"{name}_e2e"] = result["results_finetune"]
+
+            # Zapisz timing i straty pre-treningu
+            timing_per_algo[name] = {
+                "hpo_seconds":      round(_t_hpo_end - _t_hpo_start, 2),
+                "pretrain_seconds": round(_t_pretrain_end - _t_pretrain_start, 2),
+            }
+            if result.get("pretrain_losses"):
+                pretrain_losses_per_algo[name] = [
+                    round(float(v), 6) for v in result["pretrain_losses"]
+                ]
 
         except Exception as _exc:
             # Błąd (np. NaN/Inf w BYOL) nie może zatrzymać całego seeda.
@@ -394,7 +416,7 @@ def run_one_seed(
                 meta=meta or {},
             )
 
-    return seed_results
+    return seed_results, timing_per_algo, pretrain_losses_per_algo
 
 
 # ===========================================================================
@@ -862,6 +884,36 @@ def _load_existing_results(results_file: Path) -> Dict[str, Any]:
     return {}
 
 
+def _collect_environment(args: argparse.Namespace) -> Dict[str, Any]:
+    """Zbiera metadane środowiska uruchomieniowego."""
+    import platform
+    env: Dict[str, Any] = {
+        "python_version": sys.version.split()[0],
+        "torch_version": torch.__version__,
+        "platform": platform.platform(),
+        "cli": vars(args),
+    }
+    try:
+        git_hash = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL,
+            cwd=str(Path(__file__).parent),
+        ).decode().strip()
+        dirty = subprocess.call(
+            ["git", "diff", "--quiet"],
+            stderr=subprocess.DEVNULL,
+            cwd=str(Path(__file__).parent),
+        ) != 0
+        env["git_commit"] = git_hash
+        env["git_dirty"] = dirty
+    except Exception:
+        env["git_commit"] = "unknown"
+        env["git_dirty"] = None
+    if torch.cuda.is_available():
+        env["cuda_version"] = torch.version.cuda
+        env["gpu_name"] = torch.cuda.get_device_name(0)
+    return env
+
+
 def _save_results_atomic(results_file: Path, data: Dict[str, Any]) -> None:
     """Atomowy zapis pliku wyników (tmp + os.replace)."""
     results_file.parent.mkdir(parents=True, exist_ok=True)
@@ -885,6 +937,9 @@ def _merge_seed_result(
     seed: int,
     seed_res: Dict[str, Any],
     args: argparse.Namespace,
+    timing: Optional[Dict[str, Any]] = None,
+    pretrain_losses: Optional[Dict[str, Any]] = None,
+    dataset_info: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Scala wynik jednego seedu z istniejącym słownikiem wyników."""
     existing_results = existing.get("results", {})
@@ -892,11 +947,33 @@ def _merge_seed_result(
     existing_results.setdefault(s_key, {})
     for algo, frac_data in seed_res.items():
         if algo.startswith("_"):
-            # _failures is a list — persist as-is, don't convert through frac dict
             existing_results[s_key][algo] = frac_data
         else:
             existing_results[s_key][algo] = {str(f): m for f, m in frac_data.items()}
-    return {"config": vars(args), "results": existing_results}
+
+    cfg = dict(vars(args))
+
+    if timing:
+        cfg.setdefault("timing", {})[s_key] = timing
+        # Przenieś akumulowane timing z existing_config
+        for prev_key, prev_val in existing.get("config", {}).get("timing", {}).items():
+            cfg["timing"].setdefault(prev_key, prev_val)
+
+    if pretrain_losses:
+        cfg.setdefault("pretrain_loss", {})[s_key] = pretrain_losses
+        for prev_key, prev_val in existing.get("config", {}).get("pretrain_loss", {}).items():
+            cfg["pretrain_loss"].setdefault(prev_key, prev_val)
+
+    if dataset_info is not None:
+        cfg.setdefault("dataset_info", {})[s_key] = dataset_info
+        for prev_key, prev_val in existing.get("config", {}).get("dataset_info", {}).items():
+            cfg["dataset_info"].setdefault(prev_key, prev_val)
+
+    # Zachowaj environment z istniejącego config (zapisywane raz na początku)
+    if "environment" in existing.get("config", {}):
+        cfg["environment"] = existing["config"]["environment"]
+
+    return {"config": cfg, "results": existing_results}
 
 
 def main() -> None:
@@ -971,6 +1048,11 @@ def main() -> None:
     # Wczytaj istniejące wyniki (do --resume i do scalania)
     existing_data = _load_existing_results(results_file)
 
+    # Zapisz environment raz (na początku, przed pętlą po seedach)
+    if "environment" not in existing_data.get("config", {}):
+        env_info = _collect_environment(args)
+        existing_data.setdefault("config", {})["environment"] = env_info
+
     seeds_to_run = list(args.seeds)
     if args.resume:
         already_done = set(existing_data.get("results", {}).keys())
@@ -990,14 +1072,48 @@ def main() -> None:
         else:
             X_seed, y_seed = X_full, y_full
 
-        seed_res = run_one_seed(seed, X_seed, y_seed, algorithms, cfg["factory"],
-                                args, device,
-                                factory_kwargs=cfg.get("factory_kwargs"),
-                                meta=meta)
+        seed_res, seed_timing, seed_pretrain_losses = run_one_seed(
+            seed, X_seed, y_seed, algorithms, cfg["factory"],
+            args, device,
+            factory_kwargs=cfg.get("factory_kwargs"),
+            meta=meta,
+        )
         all_seed_results[seed] = seed_res
 
+        # dataset_info per seed: liczba próbek + opcjonalne fraud_rate
+        dm_cfg = DataModuleConfig(
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            seed=seed,
+            label_fractions=LABEL_FRACTIONS,
+        )
+        split_file = Path(args.splits_dir) / f"{args.dataset}_seed_{seed}.json"
+        _dm_tmp = cfg["factory"](
+            X_seed, y_seed,
+            config=dm_cfg,
+            split_file=split_file,
+            **(cfg.get("factory_kwargs") or {}),
+        )
+        seed_dataset_info: Dict[str, Any] = {
+            "n_train": len(_dm_tmp.train_dataset),
+            "n_val":   len(_dm_tmp.val_dataset),
+            "n_test":  len(_dm_tmp.test_dataset),
+        }
+        if "fraud_rate_original" in meta:
+            seed_dataset_info["fraud_rate_original"] = meta["fraud_rate_original"]
+            # Efektywna stopa fraudów PO subsamplingu (y_seed jest już po subsamplingu)
+            if y_seed.numel() > 0:
+                seed_dataset_info["fraud_rate_effective"] = float(
+                    (y_seed == 1).sum().item() / y_seed.numel()
+                )
+
         # Zapis po każdym seedzie — checkpoint pod limit 12 h
-        existing_data = _merge_seed_result(existing_data, seed, seed_res, args)
+        existing_data = _merge_seed_result(
+            existing_data, seed, seed_res, args,
+            timing=seed_timing,
+            pretrain_losses=seed_pretrain_losses,
+            dataset_info=seed_dataset_info,
+        )
         _save_results_atomic(results_file, existing_data)
         print(f"  [checkpoint] seed={seed} zapisany → {results_file}")
 

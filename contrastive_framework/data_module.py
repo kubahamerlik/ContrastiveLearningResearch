@@ -420,6 +420,13 @@ class DataModule:
         g.manual_seed(self.cfg.seed + extra)
         return g
 
+    def _worker_init_fn(self, worker_id: int) -> None:
+        """Deterministyczne seedy dla workerów DataLoadera — ważne przy num_workers>0."""
+        import numpy as np
+        worker_seed = self.cfg.seed + worker_id
+        np.random.seed(worker_seed % (2**32))
+        torch.manual_seed(worker_seed)
+
     def pretrain_loader(self) -> DataLoader:
         if getattr(self, "_byol_asymmetric", False):
             aug_dataset = AugmentedPairDataset(
@@ -439,6 +446,7 @@ class DataModule:
             pin_memory=self.cfg.pin_memory,
             drop_last=True,
             generator=self._make_generator(0),
+            worker_init_fn=self._worker_init_fn if self.cfg.num_workers > 0 else None,
         )
 
     def finetune_loader(self, fraction: float) -> DataLoader:
@@ -458,6 +466,7 @@ class DataModule:
             num_workers=self.cfg.num_workers,
             pin_memory=self.cfg.pin_memory,
             generator=self._make_generator(int(fraction * 1000)),
+            worker_init_fn=self._worker_init_fn if self.cfg.num_workers > 0 else None,
         )
 
     def val_loader(self) -> DataLoader:

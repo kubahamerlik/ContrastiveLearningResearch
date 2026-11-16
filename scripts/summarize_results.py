@@ -470,6 +470,102 @@ def _write_figures(
 
 
 # ---------------------------------------------------------------------------
+# Eksport danych dla rozdziału metodyki (p4)
+# ---------------------------------------------------------------------------
+
+def _write_dataset_info(input_paths: List[Path], out_dir: Path) -> None:
+    """Zapisuje dataset_info.json z meta danych z config każdego pliku."""
+    merged: Dict[str, Any] = {}
+    for p in input_paths:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        cfg = raw.get("config", {})
+        # dataset_info per seed (jeśli jest) lub ogólne meta
+        di = cfg.get("dataset_info")
+        if di:
+            merged.update(di)
+        # Dorzuć podstawowe meta z config
+        for key in ("dataset", "subsample"):
+            if key in cfg and "dataset" not in merged:
+                merged[key] = cfg[key]
+    if merged:
+        _save_atomic(out_dir / "dataset_info.json",
+                     json.dumps(merged, indent=2, default=_json_default))
+
+
+def _write_environment(input_paths: List[Path], out_dir: Path) -> None:
+    """Zapisuje environment.json z config pierwszego pliku."""
+    for p in input_paths:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        env = raw.get("config", {}).get("environment")
+        if env:
+            _save_atomic(out_dir / "environment.json",
+                         json.dumps(env, indent=2, default=_json_default))
+            return
+
+
+def _write_timing_csv(input_paths: List[Path], out_dir: Path) -> None:
+    """Zapisuje timing.csv z config.timing (jeśli jest)."""
+    rows = []
+    for p in input_paths:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        timing = raw.get("config", {}).get("timing")
+        if not timing:
+            continue
+        for seed_str, algo_map in timing.items():
+            for algo, t in algo_map.items():
+                row = {"seed": seed_str, "algorithm": algo}
+                if isinstance(t, dict):
+                    row.update(t)
+                rows.append(row)
+    if not rows:
+        return
+    # Zbierz wszystkie możliwe klucze (poza seed/algorithm)
+    extra_keys: list = []
+    seen_keys: set = set()
+    for r in rows:
+        for k in r:
+            if k not in ("seed", "algorithm") and k not in seen_keys:
+                extra_keys.append(k)
+                seen_keys.add(k)
+    fieldnames = ["seed", "algorithm"] + extra_keys
+    import io
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore",
+                            restval="")
+    writer.writeheader()
+    writer.writerows(rows)
+    _save_atomic(out_dir / "timing.csv", buf.getvalue())
+
+
+def _write_pretrain_loss_csv(input_paths: List[Path], out_dir: Path) -> None:
+    """Zapisuje pretrain_loss.csv z config.pretrain_loss (jeśli jest)."""
+    rows = []
+    for p in input_paths:
+        raw = json.loads(p.read_text(encoding="utf-8"))
+        pl = raw.get("config", {}).get("pretrain_loss")
+        if not pl:
+            continue
+        for seed_str, algo_map in pl.items():
+            for algo, losses in algo_map.items():
+                if isinstance(losses, (list, tuple)):
+                    for epoch, loss in enumerate(losses, start=1):
+                        rows.append({
+                            "algorithm": algo,
+                            "seed": seed_str,
+                            "epoch": epoch,
+                            "loss": loss,
+                        })
+    if not rows:
+        return
+    import io
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=["algorithm", "seed", "epoch", "loss"])
+    writer.writeheader()
+    writer.writerows(rows)
+    _save_atomic(out_dir / "pretrain_loss.csv", buf.getvalue())
+
+
+# ---------------------------------------------------------------------------
 # Główna funkcja (wywoływana z testów i z CLI)
 # ---------------------------------------------------------------------------
 
@@ -533,6 +629,18 @@ def summarize(
     ]
     _save_atomic(out_dir / "failures.json",
                  json.dumps(all_failures, indent=2, default=_json_default))
+
+    # 7. dataset_info.json (z config)
+    _write_dataset_info(input_paths, out_dir)
+
+    # 8. environment.json (z config)
+    _write_environment(input_paths, out_dir)
+
+    # 9. timing.csv
+    _write_timing_csv(input_paths, out_dir)
+
+    # 10. pretrain_loss.csv
+    _write_pretrain_loss_csv(input_paths, out_dir)
 
 
 # ---------------------------------------------------------------------------
