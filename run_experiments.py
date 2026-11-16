@@ -833,6 +833,11 @@ def parse_args() -> argparse.Namespace:
                         "Uruchom raz przed dwoma równoległymi procesami na Kaggle.")
     p.add_argument("--resume", action="store_true", default=False,
                    help="Pomiń seedy już obecne w --results-file (wznawianie po przerwaniu).")
+    p.add_argument("--out-dir", default=None,
+                   help="Katalog eksportu (summarize_results.py); "
+                        "domyślnie outputs/<dataset>/")
+    p.add_argument("--decimal-comma", action="store_true", default=False,
+                   help="Użyj przecinka dziesiętnego w tabelach LaTeX.")
     return p.parse_args()
 
 
@@ -1063,6 +1068,33 @@ def main() -> None:
     ]
     if pairs:
         print_paired_diff_table(all_seed_results, pairs)
+
+    # Eksport do outputs/<dataset>/
+    out_dir = Path(args.out_dir) if getattr(args, "out_dir", None) else Path("outputs") / args.dataset
+    try:
+        from scripts.summarize_results import summarize as _summarize
+    except ImportError:
+        try:
+            import importlib.util as _ilu
+            _spec = _ilu.spec_from_file_location(
+                "summarize_results",
+                Path(__file__).parent / "scripts" / "summarize_results.py",
+            )
+            _smod = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_smod)
+            _summarize = _smod.summarize
+        except Exception as _e:
+            print(f"\n[summarize] Nie można zaimportować summarize_results.py: {_e}")
+            _summarize = None
+
+    if _summarize is not None:
+        _summarize(
+            [results_file],
+            out_dir,
+            pairs=pairs,
+            decimal_comma=getattr(args, "decimal_comma", False),
+        )
+        print(f"\n[summarize] Pliki eksportu → {out_dir}/")
 
 
 if __name__ == "__main__":

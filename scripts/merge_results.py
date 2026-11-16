@@ -172,6 +172,10 @@ def main() -> None:
     p.add_argument("--wilcoxon", action="store_true", default=False,
                    help="Wykonaj test Wilcoxona vs baseline (tak jak --wilcoxon w run_experiments.py)")
     p.add_argument("--correction", choices=["holm", "bh"], default="holm")
+    p.add_argument("--out-dir", type=Path, default=None,
+                   help="Katalog eksportu summarize_results.py; domyślnie outputs/<dataset>/")
+    p.add_argument("--decimal-comma", action="store_true", default=False,
+                   help="Użyj przecinka dziesiętnego w tabelach LaTeX.")
     args = p.parse_args()
 
     files = [Path(f) for f in args.files]
@@ -264,6 +268,32 @@ def main() -> None:
         ]
         if pairs:
             print_paired_diff_table(all_seed_results, pairs)
+
+    # Eksport do outputs/<dataset>/
+    out_dir = getattr(args, "out_dir", None)
+    if out_dir is None:
+        ds = merged.get("config", {}).get("dataset", "unknown")
+        out_dir = Path("outputs") / ds
+    try:
+        from summarize_results import summarize as _summarize
+    except ImportError:
+        _summarize = None
+    if _summarize is not None:
+        _pairs = []
+        ds = merged.get("config", {}).get("dataset")
+        if ds and ds in DATASET_CONFIG:
+            _pairs = [
+                {"ssl": a["name"], "baseline": a["baseline"]}
+                for a in DATASET_CONFIG[ds]["algorithms"]
+                if "baseline" in a
+            ]
+        _summarize(
+            [out_path],
+            Path(out_dir),
+            pairs=_pairs,
+            decimal_comma=getattr(args, "decimal_comma", False),
+        )
+        print(f"\n[summarize] Pliki eksportu → {out_dir}/")
 
 
 if __name__ == "__main__":
