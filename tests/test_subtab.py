@@ -618,7 +618,7 @@ class TestSubTabHPO:
     def test_subtab_init_warns_missing_columns(self):
         """
         SubTabModel.__init__ emituje ostrzeżenie gdy n_subsets nie dzieli num_features
-        (kolumny na końcu są pomijane przez podzbiory).
+        i automatycznie koryguje do największego dzielnika ≤ n_subsets.
         """
         import warnings
         with warnings.catch_warnings(record=True) as w:
@@ -627,7 +627,45 @@ class TestSubTabHPO:
 
         messages = [str(warning.message) for warning in w]
         assert any("kolumn" in m.lower() or "pokryt" in m.lower() or "subset" in m.lower()
+                   or "koryguje" in m.lower() or "dzieli" in m.lower()
                    for m in messages), (
-            f"Brak ostrzeżenia dla n_subsets=4, num_features=30 (2 kolumny pominięte). "
+            f"Brak ostrzeżenia dla n_subsets=4, num_features=30. "
             f"Otrzymane ostrzeżenia: {messages}"
         )
+
+    def test_subtab_n_subsets_auto_corrected(self):
+        """
+        Gdy n_subsets nie dzieli num_features, SubTabModel automatycznie koryguje n_subsets
+        do największego dzielnika ≤ n_subsets. Wynikowy model musi działać poprawnie.
+        """
+        import warnings
+        # 30 / 4 = 7.5 → n_subsets powinien być skorygowany do 3 (dzielnik 30 ≤ 4)
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            m = SubTabModel(num_features=30, n_subsets=4)
+
+        # Model musi działać po korekcji
+        x = torch.randn(8, 30)
+        with torch.no_grad():
+            loss_dict = m.pretrain_step(x)
+        assert "loss" in loss_dict and torch.isfinite(loss_dict["loss"]), (
+            "SubTabModel po auto-korekcie n_subsets nie działa poprawnie"
+        )
+        # n_subsets=3 → n_col_subset=10, żadne kolumny nie są pomijane
+        assert m._n_col_subset == 10, (
+            f"Po korekcie n_subsets=4→3 dla 30 cech, _n_col_subset powinien=10, got {m._n_col_subset}"
+        )
+
+    def test_random_init_subtab_arch_n_subsets_auto_corrected(self):
+        """RandomInitSubTabArchModel też auto-koryguje n_subsets gdy nie dzieli num_features."""
+        import warnings
+        from contrastive_framework.models.tabular_models import RandomInitSubTabArchModel
+        with warnings.catch_warnings(record=True):
+            warnings.simplefilter("always")
+            m = RandomInitSubTabArchModel(num_features=30, n_subsets=4)
+
+        x = torch.randn(8, 30)
+        with torch.no_grad():
+            # RandomInitModel zwraca loss=0, model musi działać
+            loss_dict = m.pretrain_step(x)
+        assert torch.isfinite(loss_dict["loss"])

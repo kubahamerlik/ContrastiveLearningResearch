@@ -16,8 +16,9 @@ i szacunki czasu na sesję GPU T4 x2 (12 h limit).
 | Credit Card | **RandomInit-SubTabArch** | Nowy model (poprzednio nie istniał) | **TAK** (brak poprzednich wyników) |
 | Credit Card | **SCARF** | InfoNCE zamiast NT-Xent; dokładnie ⌊c·M⌋ cech; marginale X_train; τ=1.0 | **TAK** |
 | Credit Card | **RandomInit** (MLP) | Bez zmian | nie |
-| PathMNIST | **MoCo** | MLP głowica bez BN; SplitBN; τ=0.2; kolejka K dostosowana do n_train | **TAK** |
-| PathMNIST | **BYOL** | Poprawiony τ schedule (rosnący); poprawione augmentacje (solarize/blur, saturation); target w train() | **TAK** |
+| PathMNIST | **MoCo** | MLP głowica bez BN; SplitBN w obu enkoderach (q i k) + single-GPU batch shuffle; τ=0.2; kolejka K dostosowana do n_train | **TAK** |
+| PathMNIST | **BYOL** | Poprawiony τ schedule (rosnący); poprawione augmentacje (solarize/blur, saturation); target w train(); crop_scale=(0.08,1.0) jak oryginał | **TAK** |
+| UCI HAR | **TS-TCC** (strong aug) | strong_augmentation przepisana per-sample (losowe punkty podziału, n_segs=1 → brak permutacji) — wierniej niż poprzednio | **TAK** |
 | PathMNIST | **RandomInit** (CNN) | Bez zmian | nie |
 
 **Podsumowanie: nie trzeba przeliczać** `RandomInit` (MLP) dla Credit Card i PathMNIST.

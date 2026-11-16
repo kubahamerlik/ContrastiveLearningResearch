@@ -496,14 +496,18 @@ class SubTabModel(BaseContrastiveModel):
     ) -> None:
         import warnings
         if num_features % n_subsets != 0:
-            skipped = num_features % n_subsets
+            # Oryginalny subset_generator gubi kolumny z reszty — znajdź największy
+            # dzielnik num_features ≤ n_subsets żeby nie gubić żadnych cech.
+            corrected = max(
+                d for d in range(1, n_subsets + 1) if num_features % d == 0
+            )
             warnings.warn(
-                f"SubTabModel: n_subsets={n_subsets} nie dzieli num_features={num_features} "
-                f"({skipped} kolumn na końcu nie będzie pokrytych przez żaden podzbiór). "
-                f"Użyj n_subsets będącego dzielnikiem {num_features}.",
+                f"SubTabModel: n_subsets={n_subsets} nie dzieli num_features={num_features}. "
+                f"Automatycznie korygujemy na n_subsets={corrected} (największy dzielnik ≤ {n_subsets}).",
                 UserWarning,
                 stacklevel=2,
             )
+            n_subsets = corrected
         # Obliczamy subset_dim przed inicjalizacją BaseContrastiveModel
         n_col_subset = num_features // n_subsets
         n_overlap = int(overlap * n_col_subset)
@@ -813,6 +817,18 @@ class RandomInitSubTabArchModel(BaseContrastiveModel):
         reconstruct_subset: bool = False,
         cosine_similarity: bool = False,
     ) -> None:
+        import warnings as _warnings
+        if num_features % n_subsets != 0:
+            corrected = max(
+                d for d in range(1, n_subsets + 1) if num_features % d == 0
+            )
+            _warnings.warn(
+                f"RandomInitSubTabArchModel: n_subsets={n_subsets} nie dzieli num_features={num_features}. "
+                f"Automatycznie korygujemy na n_subsets={corrected}.",
+                UserWarning,
+                stacklevel=2,
+            )
+            n_subsets = corrected
         n_col_subset = num_features // n_subsets
         n_overlap = int(overlap * n_col_subset)
         subset_dim = n_col_subset + n_overlap

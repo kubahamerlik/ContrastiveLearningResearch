@@ -687,7 +687,7 @@ def _build_byol_augmentation(
     normalize_mean: Optional[tuple] = None,
     normalize_std: Optional[tuple] = None,
     vertical_flip: bool = True,
-    crop_scale: tuple = (0.2, 1.0),
+    crop_scale: tuple = (0.08, 1.0),
 ):
     """
     Asymetryczne augmentacje dla BYOL (Grill et al. 2020 Appendix B).
@@ -709,9 +709,8 @@ def _build_byol_augmentation(
     vertical_flip : bool
         True = VerticalFlip p=0.5 (dla histologii). Opisane w DEVIATIONS.md.
     crop_scale : tuple
-        Zakres skali RandomResizedCrop. Oryginał nie podaje wprost —
-        używamy (0.2, 1.0) jak SimCLR (opisane w DEVIATIONS.md).
-        Dla małych obrazów (28×28) rozważ (0.5, 1.0) — parametryzowane tutaj.
+        Zakres skali RandomResizedCrop. Port z byol/utils/dataset.py:
+        area_range=(0.08, 1.0) — identycznie jak oryginał (opisane w DEVIATIONS.md).
 
     Normalize dodawane NA KOŃCU (po RandomSolarize), bo solarize działa
     na wartościach w [0, 1] — tak samo jak w oryginalnym kodzie BYOL.
