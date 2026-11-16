@@ -18,7 +18,7 @@ i szacunki czasu na sesję GPU T4 x2 (12 h limit).
 | Credit Card | **RandomInit** (MLP) | Bez zmian | nie |
 | PathMNIST | **MoCo** | MLP głowica bez BN; SplitBN; τ=0.2; kolejka K dostosowana do n_train | **TAK** |
 | PathMNIST | **BYOL** | Poprawiony τ schedule (rosnący); poprawione augmentacje (solarize/blur, saturation); target w train() | **TAK** |
-| PathMNIST | **RandomInit** (MLP) | Bez zmian | nie |
+| PathMNIST | **RandomInit** (CNN) | Bez zmian | nie |
 
 **Podsumowanie: nie trzeba przeliczać** `RandomInit` (MLP) dla Credit Card i PathMNIST.
 
