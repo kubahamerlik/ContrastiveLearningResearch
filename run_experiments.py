@@ -38,6 +38,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Type
 
@@ -47,12 +49,13 @@ from scipy.stats import wilcoxon, t as student_t
 from contrastive_framework import (
     DataModule, DataModuleConfig,
     tabular_data_module, image_data_module, sequence_data_module,
-    SCARFModel, SubTabModel,
+    SCARFModel, SubTabModel, RandomInitSubTabArchModel,
     MoCoModel, BYOLModel,
     TSTCCModel,
     RandomInitModel,
     run_experiment,
 )
+from contrastive_framework.models.timeseries_models import RandomInitHARModel
 from contrastive_framework.hpo import optimize
 from contrastive_framework.experiment import filter_model_kwargs, finetune_end_to_end
 from contrastive_framework.datasets import (
@@ -74,11 +77,11 @@ DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
         "algorithms": [
             {
                 "name": "RandomInit",
-                "model_class": RandomInitModel,
+                "model_class": RandomInitHARModel,
                 "fixed_kwargs_from_meta": lambda m: {
-                    "encoder_type": "cnn",
-                    "input_dim":    m["in_channels"],
-                    "num_classes":  m["num_classes"],
+                    "seq_len":     m["seq_len"],
+                    "in_channels": m["in_channels"],
+                    "num_classes": m["num_classes"],
                 },
             },
             {
@@ -117,6 +120,14 @@ DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
             {
                 "name": "SubTab",
                 "model_class": SubTabModel,
+                "fixed_kwargs_from_meta": lambda m: {
+                    "num_features": m["num_features"],
+                    "num_classes":  m["num_classes"],
+                },
+            },
+            {
+                "name": "RandomInit-SubTabArch",
+                "model_class": RandomInitSubTabArchModel,
                 "fixed_kwargs_from_meta": lambda m: {
                     "num_features": m["num_features"],
                     "num_classes":  m["num_classes"],
@@ -219,6 +230,21 @@ def _maybe_visualize(
         print(f"  [Viz] Błąd wizualizacji dla {name}: {exc}")
 
 
+def _seed_everything(seed: int) -> None:
+    """Ustawia globalne seedy torch/numpy/random dla reprodukowalności per-seed.
+
+    Wywoływane na początku każdego seeda — gwarantuje że wynik nie zależy od
+    kolejności seedów ani od tego, na której karcie/w którym procesie był liczony.
+    """
+    import random
+    import numpy as np
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def run_one_seed(
     seed: int,
     X: torch.Tensor,
@@ -231,8 +257,10 @@ def run_one_seed(
     meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Pełna procedura dla jednego seedu: HPO (val) → finalny trening → test."""
+    _seed_everything(seed)
+
     print(f"\n{'#'*64}")
-    print(f"  SEED {seed}")
+    print(f"  SEED {seed}  (device: {device})")
     print(f"{'#'*64}")
 
     cfg = DataModuleConfig(
@@ -668,6 +696,18 @@ def parse_args() -> argparse.Namespace:
                    help="Katalog do zapisu wytrenowanych modeli (state_dict).")
     p.add_argument("--monitor-metrics", action="store_true", default=False,
                    help="Loguj alignment i uniformity (Wang & Isola 2020) co 10 epok.")
+    p.add_argument("--algorithms", nargs="+", default=None, metavar="NAME",
+                   help="Uruchom tylko podane algorytmy (np. --algorithms MoCo BYOL). "
+                        "Domyślnie: wszystkie algorytmy dla danego datasetu.")
+    p.add_argument("--device", default=None,
+                   help="Urządzenie obliczeniowe: cuda, cuda:0, cuda:1, cpu. "
+                        "Domyślnie: cuda jeśli dostępna, inaczej cpu. "
+                        "Alternatywnie ustaw CUDA_VISIBLE_DEVICES=0 i pomiń tę flagę.")
+    p.add_argument("--prepare-only", action="store_true", default=False,
+                   help="Pobierz dane i wygeneruj splity dla --seeds bez trenowania. "
+                        "Uruchom raz przed dwoma równoległymi procesami na Kaggle.")
+    p.add_argument("--resume", action="store_true", default=False,
+                   help="Pomiń seedy już obecne w --results-file (wznawianie po przerwaniu).")
     return p.parse_args()
 
 
@@ -675,12 +715,62 @@ def parse_args() -> argparse.Namespace:
 # MAIN
 # ===========================================================================
 
+def _resolve_device(device_str: Optional[str]) -> torch.device:
+    """Parsuje flagę --device. Fallback: cuda jeśli dostępna, inaczej cpu."""
+    if device_str is not None:
+        return torch.device(device_str)
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def _load_existing_results(results_file: Path) -> Dict[str, Any]:
+    """Wczytuje istniejący plik wyników lub zwraca pusty słownik."""
+    if results_file.exists():
+        try:
+            return json.loads(results_file.read_text())
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def _save_results_atomic(results_file: Path, data: Dict[str, Any]) -> None:
+    """Atomowy zapis pliku wyników (tmp + os.replace)."""
+    results_file.parent.mkdir(parents=True, exist_ok=True)
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=results_file.parent, suffix=".tmp"
+    )
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp_path, results_file)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _merge_seed_result(
+    existing: Dict[str, Any],
+    seed: int,
+    seed_res: Dict[str, Any],
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    """Scala wynik jednego seedu z istniejącym słownikiem wyników."""
+    existing_results = existing.get("results", {})
+    s_key = str(seed)
+    existing_results.setdefault(s_key, {})
+    for algo, frac_data in seed_res.items():
+        existing_results[s_key][algo] = {str(f): m for f, m in frac_data.items()}
+    return {"config": vars(args), "results": existing_results}
+
+
 def main() -> None:
     args = parse_args()
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = _resolve_device(args.device)
     print(f"Urządzenie: {device}")
 
-    if torch.cuda.is_available():
+    if device.type == "cuda":
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
@@ -701,10 +791,59 @@ def main() -> None:
         {**algo, "fixed_kwargs": algo["fixed_kwargs_from_meta"](meta)}
         for algo in cfg["algorithms"]
     ]
+    if args.algorithms is not None:
+        unknown = set(args.algorithms) - {a["name"] for a in algorithms}
+        if unknown:
+            raise ValueError(
+                f"Nieznane algorytmy: {sorted(unknown)}. "
+                f"Dostępne dla {args.dataset}: {[a['name'] for a in algorithms]}"
+            )
+        algorithms = [a for a in algorithms if a["name"] in args.algorithms]
     print(f"  algorytmy: {[a['name'] for a in algorithms]}")
 
+    results_file = Path(args.results_file or f"results_{args.dataset}.json")
+
+    # --prepare-only: pobierz dane + wygeneruj splity, nie trenuj
+    if args.prepare_only:
+        print("\n[--prepare-only] Generuję splity dla wszystkich seedów...")
+        for seed in args.seeds:
+            if args.subsample is not None and args.subsample < X_full.shape[0]:
+                from contrastive_framework.datasets import _stratified_subsample
+                g = torch.Generator()
+                g.manual_seed(seed)
+                idx = _stratified_subsample(y_full, args.subsample, g)
+                X_seed, y_seed = X_full[idx], y_full[idx]
+            else:
+                X_seed, y_seed = X_full, y_full
+
+            from contrastive_framework.data_module import DataModuleConfig
+            splits_dir = Path(args.splits_dir)
+            splits_dir.mkdir(exist_ok=True, parents=True)
+            split_file = splits_dir / f"{args.dataset}_seed_{seed}.json"
+            cfg_dm = DataModuleConfig(
+                batch_size=args.batch_size, seed=seed, label_fractions=LABEL_FRACTIONS,
+            )
+            # Każda factory generuje split i zapisuje do JSON
+            factory_kw = dict(cfg.get("factory_kwargs") or {})
+            dm = cfg["factory"](X_seed, y_seed, config=cfg_dm, split_file=split_file,
+                                **factory_kw)
+            print(f"  seed={seed}: split zapisany → {split_file}")
+        print("[--prepare-only] Gotowe. Uruchom teraz procesy równoległe.")
+        return
+
+    # Wczytaj istniejące wyniki (do --resume i do scalania)
+    existing_data = _load_existing_results(results_file)
+
+    seeds_to_run = list(args.seeds)
+    if args.resume:
+        already_done = set(existing_data.get("results", {}).keys())
+        seeds_to_run = [s for s in seeds_to_run if str(s) not in already_done]
+        skipped = set(str(s) for s in args.seeds) - set(str(s) for s in seeds_to_run)
+        if skipped:
+            print(f"\n[--resume] Pomijam seedy już w {results_file}: {sorted(skipped)}")
+
     all_seed_results: Dict[int, Dict[str, Any]] = {}
-    for seed in args.seeds:
+    for seed in seeds_to_run:
         if args.subsample is not None and args.subsample < X_full.shape[0]:
             from contrastive_framework.datasets import _stratified_subsample
             g = torch.Generator()
@@ -720,23 +859,22 @@ def main() -> None:
                                 meta=meta)
         all_seed_results[seed] = seed_res
 
-    results_file = Path(args.results_file or f"results_{args.dataset}.json")
-    results_file.write_text(
-        json.dumps(
-            {
-                "config": vars(args),
-                "results": {
-                    str(s): {
-                        algo: {str(f): m
-                               for f, m in frac_data.items()}
-                        for algo, frac_data in res.items()
-                    } for s, res in all_seed_results.items()
-                },
-            },
-            indent=2,
-        )
-    )
-    print(f"\nSurowe wyniki zapisane → {results_file}")
+        # Zapis po każdym seedzie — checkpoint pod limit 12 h
+        existing_data = _merge_seed_result(existing_data, seed, seed_res, args)
+        _save_results_atomic(results_file, existing_data)
+        print(f"  [checkpoint] seed={seed} zapisany → {results_file}")
+
+    if not seeds_to_run:
+        print("\nBrak seedów do uruchomienia.")
+        all_seed_results = {
+            int(s): {
+                algo: {float(f): m for f, m in frac_data.items()}
+                for algo, frac_data in res.items()
+            }
+            for s, res in existing_data.get("results", {}).items()
+        }
+
+    print(f"\nSurowe wyniki zapisane/scalone → {results_file}")
 
     aggregated   = aggregate(all_seed_results)
     significance = wilcoxon_vs_baseline(

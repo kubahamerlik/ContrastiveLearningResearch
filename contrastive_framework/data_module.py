@@ -8,6 +8,8 @@ Podziały są zapisywane do JSON i odczytywane przy kolejnych uruchomieniach
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -66,6 +68,32 @@ class AugmentedPairDataset(Dataset):
 
 
 # ---------------------------------------------------------------------------
+# _NormalizedDataset
+# ---------------------------------------------------------------------------
+
+class _NormalizedDataset(Dataset):
+    """Wraps a dataset, applying a transform to the first element of each item.
+
+    Used by finetune/val/test loaders to apply only Normalize (no augmentation),
+    keeping label tensors intact.
+    """
+
+    def __init__(self, dataset: Dataset, transform) -> None:
+        self.dataset = dataset
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return len(self.dataset)  # type: ignore[arg-type]
+
+    def __getitem__(self, idx: int):
+        item = self.dataset[idx]
+        if isinstance(item, (list, tuple)):
+            x = self.transform(item[0])
+            return (x,) + tuple(item[1:])
+        return self.transform(item)
+
+
+# ---------------------------------------------------------------------------
 # Konfiguracja
 # ---------------------------------------------------------------------------
 
@@ -94,14 +122,44 @@ class SplitManager:
 
     def _load(self) -> Dict[str, Dict[str, List[int]]]:
         if self.split_file.exists():
-            with open(self.split_file) as f:
+            with open(self.split_file, encoding="utf-8") as f:
                 return json.load(f)
         return {}
 
     def _save(self) -> None:
+        """Atomowy zapis: piszemy do pliku tymczasowego, potem os.replace().
+
+        Chroni przed uszkodzonym plikiem gdy dwa procesy piszą równocześnie
+        (os.replace jest atomowy na POSIX; na Windows atomowy w obrębie jednego
+        woluminu od Vista+). Jeśli inny proces zdążył zapisać ten sam klucz
+        między _load a _save, wczytujemy jego dane zamiast je nadpisać.
+        """
         self.split_file.parent.mkdir(parents=True, exist_ok=True)
-        with open(self.split_file, "w") as f:
-            json.dump(self._data, f, indent=2)
+        # Sprawdź czy inny proces zapisał plik od czasu ostatniego _load
+        if self.split_file.exists():
+            try:
+                with open(self.split_file, encoding="utf-8") as f:
+                    on_disk = json.load(f)
+                # Scal: klucze z dysku mają pierwszeństwo (zostały wygenerowane
+                # przez inny proces, są już używane — nie nadpisujemy)
+                merged = {**self._data, **on_disk}
+                self._data = merged
+            except (json.JSONDecodeError, OSError):
+                pass  # Uszkodzony plik — nadpiszemy naszymi danymi
+
+        tmp_fd, tmp_path = tempfile.mkstemp(
+            dir=self.split_file.parent, suffix=".tmp"
+        )
+        try:
+            with os.fdopen(tmp_fd, "w", encoding="utf-8") as f:
+                json.dump(self._data, f, indent=2)
+            os.replace(tmp_path, self.split_file)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def get_or_create(
         self,
@@ -111,8 +169,23 @@ class SplitManager:
         test_fraction: float,
         labels: Optional[torch.Tensor] = None,
     ) -> Tuple[List[int], List[int], List[int]]:
-        """Zwraca (train_idx, val_idx, test_idx). Tworzy lub wczytuje z pliku."""
+        """Zwraca (train_idx, val_idx, test_idx). Tworzy lub wczytuje z pliku.
+
+        Odporność na wyścig: jeśli klucz nie istnieje w pamięci, ale plik na
+        dysku już go zawiera (zapisany przez równoległy proces), wczytujemy
+        dane z dysku zamiast generować ponownie.
+        """
         key = str(seed)
+
+        # Odśwież z dysku jeśli klucz nie jest jeszcze w pamięci
+        if key not in self._data and self.split_file.exists():
+            try:
+                with open(self.split_file, encoding="utf-8") as f:
+                    on_disk = json.load(f)
+                if key in on_disk:
+                    self._data[key] = on_disk[key]
+            except (json.JSONDecodeError, OSError):
+                pass
 
         if key in self._data:
             splits = self._data[key]
@@ -266,6 +339,8 @@ class DataModule:
         self.cfg = config or DataModuleConfig()
         self.augment_fn = augment_fn
         self.hpo_done: bool = False
+        # Ustawiane przez image_data_module — transform Normalize dla val/test/finetune
+        self._normalize_tf = None
 
         N = len(full_dataset)  # type: ignore[arg-type]
 
@@ -373,8 +448,11 @@ class DataModule:
                 f"Dostępne: {sorted(self._labeled_indices)}"
             )
         indices = self._labeled_indices[fraction]
+        ds = Subset(self.train_dataset, indices)
+        if self._normalize_tf is not None:
+            ds = _NormalizedDataset(ds, self._normalize_tf)
         return DataLoader(
-            Subset(self.train_dataset, indices),
+            ds,
             batch_size=min(self.cfg.batch_size, len(indices)),
             shuffle=True,
             num_workers=self.cfg.num_workers,
@@ -384,8 +462,11 @@ class DataModule:
 
     def val_loader(self) -> DataLoader:
         """Walidacja – tylko do HPO i early stopping. Nigdy do finalnej ewaluacji."""
+        ds = self.val_dataset
+        if self._normalize_tf is not None:
+            ds = _NormalizedDataset(ds, self._normalize_tf)
         return DataLoader(
-            self.val_dataset,
+            ds,
             batch_size=self.cfg.batch_size,
             shuffle=False,
             num_workers=self.cfg.num_workers,
@@ -403,8 +484,11 @@ class DataModule:
                 "Upewnij się że HPO jest zakończone, potem: dm.hpo_done = True\n"
                 "Przedwczesny dostęp do zbioru testowego to data leakage!"
             )
+        ds = self.test_dataset
+        if self._normalize_tf is not None:
+            ds = _NormalizedDataset(ds, self._normalize_tf)
         return DataLoader(
-            self.test_dataset,
+            ds,
             batch_size=self.cfg.batch_size,
             shuffle=False,
             num_workers=self.cfg.num_workers,
@@ -554,8 +638,11 @@ def _build_contrastive_image_augmentation(
       3. ColorJitter (p=0.8)
       4. RandomGrayscale (p=0.2)
       5. GaussianBlur
+      6. Normalize(mean, std) – NA KOŃCU, po augmentacjach geometrycznych
+         i fotometrycznych. ColorJitter zakłada [0, 1] na wejściu —
+         normalizacja przed nim powodowałaby obcięcie ~40% pikseli do 0.
 
-    Działa na tensor (C, H, W) z wartościami w [0, 1].
+    Wejście: tensor (C, H, W) z wartościami w [0, 1].
     """
     try:
         import torchvision.transforms as T
@@ -583,6 +670,7 @@ def _build_contrastive_image_augmentation(
         ], p=0.8),
         T.RandomGrayscale(p=0.2),
         T.RandomApply([T.GaussianBlur(kernel_size=blur_kernel, sigma=(0.1, 2.0))], p=0.5),
+        # Normalize zawsze na końcu — po augmentacjach fotometrycznych
         *(
             [T.Normalize(mean=normalize_mean, std=normalize_std)]
             if normalize_mean is not None and normalize_std is not None
@@ -594,17 +682,39 @@ def _build_contrastive_image_augmentation(
 def _build_byol_augmentation(
     image_size: int,
     view: int,
-    jitter_strength: float = 0.5,
+    jitter_strength: float = 1.0,
     blur_kernel: Optional[int] = None,
+    normalize_mean: Optional[tuple] = None,
+    normalize_std: Optional[tuple] = None,
+    vertical_flip: bool = True,
+    crop_scale: tuple = (0.2, 1.0),
 ):
     """
     Asymetryczne augmentacje dla BYOL (Grill et al. 2020 Appendix B).
 
-    view=1 (mocny): blur p=1.0, solarize p=0.2 (jasne piksele odwrócone)
-    view=2 (słaby): blur p=0.1, brak solarize
+    Port z: deepmind-research/byol/utils/augmentations.py, augment_config:
+      view1: blur p=1.0, solarize p=0.0
+      view2: blur p=0.1, solarize p=0.2
+    ColorJitter: brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, p=0.8
+    RandomGrayscale: p=0.2
 
-    Różnica między widokami zmusza sieć online do przewidywania reprezentacji
-    z bardziej zniszczonego obrazu — trudniejsze zadanie → lepsze embeddingi.
+    WAŻNE: view1 → blur, BEZ solarize; view2 → mały blur + solarize.
+    Poprzedni kod miał odwrotne przypisanie (solarize na view1) — błąd naprawiony.
+
+    Parametry
+    ---------
+    jitter_strength : float
+        Mnożnik siły ColorJitter (domyślnie 1.0 = wartości z oryginału BYOL).
+        0.5 to wartość SimCLR — dla BYOL użyj 1.0.
+    vertical_flip : bool
+        True = VerticalFlip p=0.5 (dla histologii). Opisane w DEVIATIONS.md.
+    crop_scale : tuple
+        Zakres skali RandomResizedCrop. Oryginał nie podaje wprost —
+        używamy (0.2, 1.0) jak SimCLR (opisane w DEVIATIONS.md).
+        Dla małych obrazów (28×28) rozważ (0.5, 1.0) — parametryzowane tutaj.
+
+    Normalize dodawane NA KOŃCU (po RandomSolarize), bo solarize działa
+    na wartościach w [0, 1] — tak samo jak w oryginalnym kodzie BYOL.
     """
     try:
         import torchvision.transforms as T
@@ -614,26 +724,40 @@ def _build_byol_augmentation(
     if blur_kernel is None:
         blur_kernel = 3 if image_size <= 32 else max(3, (image_size // 10) | 1)
 
-    blur_p    = 1.0 if view == 1 else 0.1
-    solarize_p = 0.2 if view == 1 else 0.0
+    # Port z: augmentations.py augment_config:
+    #   view1: gaussian_blur apply_prob=1.0, solarize apply_prob=0.0
+    #   view2: gaussian_blur apply_prob=0.1, solarize apply_prob=0.2
+    blur_p     = 1.0 if view == 1 else 0.1
+    solarize_p = 0.0 if view == 1 else 0.2
 
+    # Port z: augmentations.py color_transform config:
+    #   brightness=0.4, contrast=0.4, saturation=0.2, hue=0.1, color_jitter_prob=0.8
+    # jitter_strength skaluje wszystkie wartości jednakowo (do ablacji)
     transforms = [
-        T.RandomResizedCrop(image_size, scale=(0.2, 1.0), antialias=True),
+        T.RandomResizedCrop(image_size, scale=crop_scale, antialias=True),
         T.RandomHorizontalFlip(p=0.5),
-        T.RandomVerticalFlip(p=0.5),
+    ]
+    if vertical_flip:
+        transforms.append(T.RandomVerticalFlip(p=0.5))
+
+    transforms += [
         T.RandomApply([
             T.ColorJitter(
-                brightness=0.8 * jitter_strength,
-                contrast=0.8   * jitter_strength,
-                saturation=0.8 * jitter_strength,
-                hue=0.2        * jitter_strength,
+                brightness=0.4 * jitter_strength,
+                contrast=0.4   * jitter_strength,
+                saturation=0.2 * jitter_strength,
+                hue=0.1        * jitter_strength,
             )
         ], p=0.8),
         T.RandomGrayscale(p=0.2),
         T.RandomApply([T.GaussianBlur(kernel_size=blur_kernel, sigma=(0.1, 2.0))], p=blur_p),
     ]
+    # Solarize tylko na view2 (view1: solarize_p=0.0 → pomijamy transform)
     if solarize_p > 0.0:
         transforms.append(T.RandomSolarize(threshold=0.5, p=solarize_p))
+    # Normalize zawsze na końcu — po wszystkich augmentacjach fotometrycznych
+    if normalize_mean is not None and normalize_std is not None:
+        transforms.append(T.Normalize(mean=normalize_mean, std=normalize_std))
 
     return T.Compose(transforms)
 
@@ -646,29 +770,40 @@ def image_data_module(
     split_file: str | Path = "splits.json",
     test_fraction: float = 0.15,
     image_size: Optional[int] = None,
-    jitter_strength: float = 0.5,
+    jitter_strength: float = 1.0,
     augment_fn=None,
     byol_asymmetric: bool = False,
 ) -> DataModule:
     """
     DataModule dla danych obrazowych (MoCo, BYOL).
 
-    Wymaga 4-D tensora `X` o kształcie (N, C, H, W). Każde wywołanie
-    augmentacji zwraca inną losową wersję wejścia, więc
+    Wymaga 4-D tensora `X` o kształcie (N, C, H, W) z wartościami w [0, 1].
+    Każde wywołanie augmentacji zwraca inną losową wersję wejścia, więc
     `AugmentedPairDataset` wygeneruje dwa różne widoki tego samego obrazu.
 
-    Normalizacja per-kanał (mean/std z trainu) jest aplikowana do całego X
-    przed zbudowaniem DataModule — dzięki temu val_loader i test_loader
-    zwracają znormalizowane dane spójne z pretrain_loader i finetune_loader.
+    Poprawna kolejność normalizacji (zgodna z MoCo v2 / BYOL):
+    - dane POZOSTAJĄ w [0, 1] — nie normalizujemy X przed zbudowaniem DataModule;
+    - pipeline pre-treningu: augmentacje → Normalize(mean, std) NA KOŃCU;
+    - loadery finetune/val/test: tylko Normalize(mean, std), bez augmentacji;
+    - mean/std liczone wyłącznie z train split (bez data leakage).
+
+    ColorJitter i RandomSolarize zakładają wartości w [0, 1]. Normalizacja
+    przed nimi powoduje obcięcie ~40% pikseli do 0 (tensor N(0,1) po clamp).
 
     Parameters
     ----------
     image_size       : opcjonalny rozmiar po RandomResizedCrop; domyślnie = H z X.
     jitter_strength  : siła ColorJitter (0–1). 0.5 to wartość z SimCLR.
-    augment_fn       : własna augmentacja; jeśli None → pełny SimCLR pipeline.
+    augment_fn       : własna augmentacja; jeśli None → pełny SimCLR pipeline
+                       z Normalize na końcu.
     byol_asymmetric  : True → asymetryczne pipeline BYOL (view1 blur p=1.0 + solarize,
                        view2 blur p=0.1). Używać dla BYOLModel (Grill et al. 2020 Appendix B).
     """
+    try:
+        import torchvision.transforms as T
+    except ImportError as e:
+        raise ImportError("image_data_module wymaga torchvision") from e
+
     if X.ndim != 4:
         raise ValueError(
             f"image_data_module oczekuje 4-D tensora (N, C, H, W); "
@@ -678,9 +813,10 @@ def image_data_module(
         )
 
     cfg = config if config is not None else DataModuleConfig()
+    H = image_size if image_size is not None else int(X.shape[-1])
 
     if augment_fn is None:
-        H = image_size if image_size is not None else int(X.shape[-1])
+        # Liczymy mean/std wyłącznie z trainu (bez data leakage)
         train_idx, _, _ = SplitManager(Path(split_file)).get_or_create(
             seed=cfg.seed,
             n_total=len(X),
@@ -689,13 +825,23 @@ def image_data_module(
             labels=y,
         )
         train_X = X[torch.tensor(train_idx, dtype=torch.long)]
-        mean = train_X.mean(dim=(0, 2, 3))          # (C,)
-        std  = train_X.std(dim=(0, 2, 3)).clamp(min=1e-7)
-        X = (X - mean[None, :, None, None]) / std[None, :, None, None]
+        mean = tuple(train_X.mean(dim=(0, 2, 3)).tolist())   # (C,)
+        std  = tuple(train_X.std(dim=(0, 2, 3)).clamp(min=1e-7).tolist())
+
+        # Transform tylko do Normalize — używany przez val/test/finetune loaders
+        normalize_tf = T.Normalize(mean=mean, std=std)
 
         if byol_asymmetric:
-            aug_v1 = _build_byol_augmentation(H, view=1, jitter_strength=jitter_strength)
-            aug_v2 = _build_byol_augmentation(H, view=2, jitter_strength=jitter_strength)
+            aug_v1 = _build_byol_augmentation(
+                H, view=1, jitter_strength=jitter_strength,
+                normalize_mean=mean, normalize_std=std,
+                vertical_flip=True,
+            )
+            aug_v2 = _build_byol_augmentation(
+                H, view=2, jitter_strength=jitter_strength,
+                normalize_mean=mean, normalize_std=std,
+                vertical_flip=True,
+            )
             dm = DataModule.from_arrays(
                 X, y,
                 config=cfg,
@@ -706,14 +852,26 @@ def image_data_module(
             dm._byol_aug_v1 = aug_v1
             dm._byol_aug_v2 = aug_v2
             dm._byol_asymmetric = True
+            dm._normalize_tf = normalize_tf
             return dm
         else:
             augment_fn = _build_contrastive_image_augmentation(
                 H, jitter_strength,
-                normalize_mean=None,
-                normalize_std=None,
+                normalize_mean=mean,
+                normalize_std=std,
             )
+            dm = DataModule.from_arrays(
+                X, y,
+                config=cfg,
+                split_file=split_file,
+                test_fraction=test_fraction,
+                augment_fn=augment_fn,
+            )
+            dm._byol_asymmetric = False
+            dm._normalize_tf = normalize_tf
+            return dm
 
+    # Własna augment_fn — brak wbudowanej normalizacji; dane idą surowe
     dm = DataModule.from_arrays(
         X, y,
         config=cfg,
@@ -722,6 +880,7 @@ def image_data_module(
         augment_fn=augment_fn,
     )
     dm._byol_asymmetric = False
+    dm._normalize_tf = None
     return dm
 
 

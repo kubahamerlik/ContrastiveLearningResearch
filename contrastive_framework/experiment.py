@@ -529,6 +529,23 @@ def run_experiment(
 
     model = model_class(**model_kwargs).to(device)
 
+    # SCARF: przekaż marginale z zbioru treningowego PRZED pre-treningiem.
+    # set_marginals() musi dostać wyłącznie dane treningowe — brak data leakage.
+    # Port z: Bahri et al. 2022 Algorithm 1 linia 2: X̂_j = {x_j : x ∈ X_train}
+    if hasattr(model, "set_marginals"):
+        # Zbierz wszystkie próbki treningowe z pretrain loadera (bez augmentacji)
+        # data_module.train_dataset to Subset(full_dataset, train_indices)
+        _train_ds = data_module.train_dataset
+        _xs: list = []
+        for _item in _train_ds:  # type: ignore[union-attr]
+            _x = _item[0] if isinstance(_item, (list, tuple)) else _item
+            _xs.append(_x)
+        _train_X = torch.stack(_xs, dim=0)
+        model.set_marginals(_train_X)
+        if verbose:
+            print(f"  [SCARF] Marginale treningowe: {_train_X.shape[0]} próbek × "
+                  f"{_train_X.shape[1]} cech")
+
     if verbose:
         print(f"\n[1/3] Pre-trening samo-nadzorowany...")
 

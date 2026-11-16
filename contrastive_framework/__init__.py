@@ -12,15 +12,16 @@ from .imputation import (
 from .hpo import optimize
 from .models.base import BaseContrastiveModel
 from .models.image_models import MoCoModel, BYOLModel
-from .models.tabular_models import SCARFModel, SubTabModel
-from .models.timeseries_models import TSTCCModel
+from .models.tabular_models import SCARFModel, SubTabModel, RandomInitSubTabArchModel
+from .models.timeseries_models import TSTCCModel, RandomInitHARModel
 from .baseline import RandomInitModel
 
 __all__ = [
     "BaseContrastiveModel",
     "MoCoModel", "BYOLModel",
-    "SCARFModel", "SubTabModel",
+    "SCARFModel", "SubTabModel", "RandomInitSubTabArchModel",
     "TSTCCModel",
+    "RandomInitHARModel",
     "RandomInitModel",
     "DataModule", "DataModuleConfig", "LABEL_FRACTIONS",
     "tabular_data_module", "image_data_module", "sequence_data_module",

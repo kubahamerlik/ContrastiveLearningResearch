@@ -46,11 +46,14 @@ def _suggest(
         base["corruption_rate"] = trial.suggest_float("corruption_rate", 0.3, 0.8)
         base["temperature"]     = trial.suggest_float("temperature",     0.1, 1.0)
 
-    elif name == "SubTabModel":
-        base["n_subsets"]  = trial.suggest_int("n_subsets", 2, 6)
-        base["overlap"]    = trial.suggest_int("overlap",   0, 4)
-        base["noise_std"]  = trial.suggest_float("noise_std", 0.01, 0.3, log=True)
-        base["temperature"]= trial.suggest_float("temperature", 0.1, 1.0)
+    elif name in ("SubTabModel", "RandomInitSubTabArchModel"):
+        base["n_subsets"]     = trial.suggest_int("n_subsets", 2, 8)
+        base["overlap"]       = trial.suggest_float("overlap", 0.0, 0.9)
+        base["masking_ratio"] = trial.suggest_float("masking_ratio", 0.1, 0.5)
+        base["noise_type"]    = trial.suggest_categorical(
+            "noise_type", ["swap_noise", "gaussian_noise", "zero_out"]
+        )
+        base["tau"]           = trial.suggest_float("tau", 0.05, 0.5, log=True)
 
     elif name == "MoCoModel":
         base["momentum"]    = trial.suggest_float("momentum",    0.99, 0.9999, log=True)
@@ -64,8 +67,7 @@ def _suggest(
     elif name == "BYOLModel":
         base["momentum"] = trial.suggest_float("momentum", 0.99, 0.9999, log=True)
 
-    elif name == "TSTCCModel":
-        base["tc_weight"]   = trial.suggest_float("tc_weight",   0.1, 0.9)
+    elif name in ("TSTCCModel", "RandomInitHARModel"):
         base["temperature"] = trial.suggest_float("temperature", 0.05, 0.5)
 
     return base

@@ -36,7 +36,8 @@ def build_mlp(
     return nn.Sequential(*layers)
 
 
-def build_encoder(encoder_type: str, input_dim: int, hidden_dim: int, output_dim: int) -> nn.Module:
+def build_encoder(encoder_type: str, input_dim: int, hidden_dim: int, output_dim: int,
+                  bn_splits: int = 1) -> nn.Module:
     """
     Fabryka koderów.
 
@@ -51,6 +52,9 @@ def build_encoder(encoder_type: str, input_dim: int, hidden_dim: int, output_dim
                        torchvision (RandomResizedCrop, ColorJitter, itd).
         'resnet_like' – DEPRECATED dla obrazów; głęboki MLP na spłaszczonych pikselach.
                         Zachowane dla wsteczności i testów na płaskich wektorach.
+    bn_splits : int
+        Tylko dla 'cnn_image'. Liczba podgrup SplitBatchNorm (1 = zwykły BN).
+        Używane przez MoCo w gałęzi encoder_k.
     """
     if encoder_type == "mlp":
         return build_mlp(input_dim, hidden_dim, output_dim, num_layers=3)
@@ -71,7 +75,7 @@ def build_encoder(encoder_type: str, input_dim: int, hidden_dim: int, output_dim
     if encoder_type == "cnn_image":
         # Wejście: (batch, input_dim, H, W) → wyjście: (batch, output_dim).
         # `input_dim` to liczba kanałów (3 dla RGB, 1 dla skali szarości).
-        return _ImageCNN(in_channels=input_dim, output_dim=output_dim)
+        return _ImageCNN(in_channels=input_dim, output_dim=output_dim, bn_splits=bn_splits)
 
     if encoder_type == "resnet_like":
         # Głęboki MLP z połączeniami residualnymi – działa na spłaszczonych pikselach
@@ -105,23 +109,108 @@ class _ResidualMLP(nn.Module):
         return self.head(self.blocks(self.stem(x)))
 
 
+class SplitBatchNorm2d(nn.Module):
+    """
+    SplitBatchNorm dla MoCo na jednej karcie GPU.
+
+    Zastępuje Shuffle BN z oryginalnego MoCo (He et al. 2020, Alg. 3), który
+    wymaga wielu GPU. Na jednej karcie dzielimy batch na `num_splits` podgrup
+    i liczymy statystyki BN niezależnie dla każdej z nich — zapobiega to temu,
+    żeby BN „podpowiadał" pary pozytywne poprzez wspólną średnią/wariancję.
+
+    Gdy batch_size < num_splits lub nie jest podzielny, ostatni niecały split
+    jest pomijany (resztę pikseli liczymy ze statystyk pełnego batcha):
+    faktycznie dla takich batchów używamy zwykłego BN.
+
+    Źródło inspiracji: MoCo CIFAR notebook
+    (https://colab.research.google.com/github/facebookresearch/moco/blob/colab-notebook/colab/moco_cifar10_demo.ipynb)
+    Licencja oryginału: CC BY-NC 4.0.
+    Zmiany: reimplementacja w PyTorch bez zależności od fb-internal code.
+    """
+
+    def __init__(self, num_features: int, num_splits: int = 8, **kwargs) -> None:
+        super().__init__()
+        self.num_features = num_features
+        self.num_splits = num_splits
+        # Wspólne parametry γ/β — uczone globalnie
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias   = nn.Parameter(torch.zeros(num_features))
+        # running stats — aktualizowane jak w zwykłym BN
+        self.register_buffer("running_mean", torch.zeros(num_features))
+        self.register_buffer("running_var",  torch.ones(num_features))
+        self.momentum = kwargs.get("momentum", 0.1)
+        self.eps      = kwargs.get("eps", 1e-5)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        N, C, H, W = x.shape
+        split_size = N // self.num_splits
+
+        if not self.training or split_size < 1:
+            # Eval mode lub za mały batch → zwykły BN z running stats
+            return F.batch_norm(
+                x, self.running_mean, self.running_var,
+                self.weight, self.bias,
+                training=self.training, momentum=self.momentum, eps=self.eps,
+            )
+
+        # Liczymy statystyki per-split, ale aktualizujemy running stats globalnie
+        usable = split_size * self.num_splits
+        x_splits = x[:usable].view(self.num_splits, split_size, C, H, W)
+        # batch_norm na każdym splicie osobno (training=True, running stats None)
+        out_splits = F.batch_norm(
+            x_splits.reshape(self.num_splits * split_size, C, H, W),
+            # Przekazujemy None jako running stats żeby nie były aktualizowane tu
+            None, None,
+            None, None,
+            training=True, momentum=0.0, eps=self.eps,
+        )
+        # Aktualizuj running stats ze statystyk całego usable batcha
+        with torch.no_grad():
+            mean = x[:usable].mean(dim=(0, 2, 3))
+            var  = x[:usable].var(dim=(0, 2, 3), unbiased=False)
+            self.running_mean.mul_(1 - self.momentum).add_(mean * self.momentum)
+            self.running_var.mul_(1 - self.momentum).add_(var  * self.momentum)
+
+        # Zastosuj γ/β ręcznie
+        out_splits = out_splits * self.weight[None, :, None, None] + self.bias[None, :, None, None]
+
+        if usable == N:
+            return out_splits
+
+        # Ostatni niecały split — zwykły BN z running stats (brak aktualizacji)
+        tail = F.batch_norm(
+            x[usable:], self.running_mean, self.running_var,
+            self.weight, self.bias,
+            training=False, momentum=self.momentum, eps=self.eps,
+        )
+        return torch.cat([out_splits, tail], dim=0)
+
+
+def _make_bn2d(num_features: int, num_splits: int = 1) -> nn.Module:
+    """Fabryka BN: zwykły BatchNorm2d gdy num_splits<=1, SplitBatchNorm2d gdy >1."""
+    if num_splits > 1:
+        return SplitBatchNorm2d(num_features, num_splits=num_splits)
+    return nn.BatchNorm2d(num_features)
+
+
 class _ImageConvBlock(nn.Module):
     """Conv + BN + ReLU + Conv + BN + skip + ReLU (rezydualny blok dla 2D)."""
 
-    def __init__(self, in_ch: int, out_ch: int, stride: int = 1) -> None:
+    def __init__(self, in_ch: int, out_ch: int, stride: int = 1,
+                 bn_splits: int = 1) -> None:
         super().__init__()
         self.conv1 = nn.Conv2d(in_ch, out_ch, kernel_size=3,
                                stride=stride, padding=1, bias=False)
-        self.bn1   = nn.BatchNorm2d(out_ch)
+        self.bn1   = _make_bn2d(out_ch, bn_splits)
         self.conv2 = nn.Conv2d(out_ch, out_ch, kernel_size=3,
                                stride=1, padding=1, bias=False)
-        self.bn2   = nn.BatchNorm2d(out_ch)
+        self.bn2   = _make_bn2d(out_ch, bn_splits)
         # Skip connection – downsample jeśli zmieniają się wymiary
         if stride != 1 or in_ch != out_ch:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_ch, out_ch, kernel_size=1,
                           stride=stride, bias=False),
-                nn.BatchNorm2d(out_ch),
+                _make_bn2d(out_ch, bn_splits),
             )
         else:
             self.shortcut = nn.Identity()
@@ -143,33 +232,39 @@ class _ImageCNN(nn.Module):
 
     Dla 28×28 obrazu wejściowego:
       28×28 → 28×28 (stem) → 14×14 (stage 2) → 7×7 (stage 3) → 1×1 (avgpool)
+
+    Parameters
+    ----------
+    bn_splits : int
+        Liczba podgrup BN (SplitBatchNorm). 1 = zwykły BatchNorm2d.
+        Wartość > 1 używana przez MoCo w gałęzi kluczy (encoder_k).
     """
 
     def __init__(self, in_channels: int, output_dim: int,
-                 base_channels: int = 64) -> None:
+                 base_channels: int = 64, bn_splits: int = 1) -> None:
         super().__init__()
         c = base_channels
 
         # Stem – brak agresywnego stride'u na początku (mały obraz)
         self.stem = nn.Sequential(
             nn.Conv2d(in_channels, c, kernel_size=3, stride=1, padding=1, bias=False),
-            nn.BatchNorm2d(c),
+            _make_bn2d(c, bn_splits),
             nn.ReLU(inplace=True),
         )
 
         # 3 stage'e, każdy z 2 blokami rezydualnymi.
         # Pierwszy blok w stage 2/3 ma stride=2 (downsampling 2×).
         self.stage1 = nn.Sequential(
-            _ImageConvBlock(c,     c,     stride=1),
-            _ImageConvBlock(c,     c,     stride=1),
+            _ImageConvBlock(c,     c,     stride=1, bn_splits=bn_splits),
+            _ImageConvBlock(c,     c,     stride=1, bn_splits=bn_splits),
         )
         self.stage2 = nn.Sequential(
-            _ImageConvBlock(c,     c * 2, stride=2),
-            _ImageConvBlock(c * 2, c * 2, stride=1),
+            _ImageConvBlock(c,     c * 2, stride=2, bn_splits=bn_splits),
+            _ImageConvBlock(c * 2, c * 2, stride=1, bn_splits=bn_splits),
         )
         self.stage3 = nn.Sequential(
-            _ImageConvBlock(c * 2, c * 4, stride=2),
-            _ImageConvBlock(c * 4, c * 4, stride=1),
+            _ImageConvBlock(c * 2, c * 4, stride=2, bn_splits=bn_splits),
+            _ImageConvBlock(c * 4, c * 4, stride=1, bn_splits=bn_splits),
         )
 
         self.pool = nn.AdaptiveAvgPool2d(1)

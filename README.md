@@ -16,18 +16,20 @@ Praca inżynierska – pełna pętla badawcza z HPO (Optuna), 10 seedami, straty
 6. [Wszystkie opcje CLI](#wszystkie-opcje-cli)
 7. [Struktura wyjścia](#struktura-wyjścia)
 8. [Modele i modalności](#modele-i-modalności)
-9. [Diagnostyka problemów](#diagnostyka-problemów)
-10. [Struktura projektu](#struktura-projektu)
+9. [Zgodność z oryginalnymi implementacjami](#zgodność-z-oryginalnymi-implementacjami)
+10. [Kaggle, 2×T4](#kaggle-2t4)
+11. [Diagnostyka problemów](#diagnostyka-problemów)
+12. [Struktura projektu](#struktura-projektu)
 
 ---
 
 ## Architektura
 
-| Modalność         | Dataset             | Baseline      | Algorytmy SSL          |
-|-------------------|---------------------|---------------|------------------------|
-| Szeregi czasowe   | UCI HAR             | `RandomInit`  | `TSTCC`                |
-| Tabelaryczne      | Credit Card Fraud   | `RandomInit`  | `SCARF`, `SubTab`      |
-| Obrazy medyczne   | PathMNIST           | `RandomInit`  | `MoCo`, `BYOL`         |
+| Modalność         | Dataset             | Baseline(y)                               | Algorytmy SSL          |
+|-------------------|---------------------|-------------------------------------------|------------------------|
+| Szeregi czasowe   | UCI HAR             | `RandomInit` (arch. CNN = TS-TCC)         | `TSTCC`                |
+| Tabelaryczne      | Credit Card Fraud   | `RandomInit`, `RandomInit-SubTabArch`     | `SCARF`, `SubTab`      |
+| Obrazy medyczne   | PathMNIST           | `RandomInit`                              | `MoCo`, `BYOL`         |
 
 **Pipeline dla każdego algorytmu:**
 1. **Pre-trening** samo-nadzorowany na zbiorze train (bez etykiet) – z warmup + cosine LR scheduler i gradient clipping (max_norm=1.0).
@@ -187,6 +189,13 @@ python run_experiments.py --help
 | `--viz-method`            | `tsne`              | `tsne` \| `umap`                                                |
 | `--viz-dir`               | `figures`           | Katalog zapisu figur                                            |
 | `--run-finetune`          | `False`             | Fine-tuning end-to-end obok linear probe                        |
+| `--algorithms NAME ...`   | wszystkie dla datasetu | Uruchom tylko podane algorytmy, np. `--algorithms MoCo BYOL` |
+| `--device`                | auto (cuda/cpu)     | Jawna karta GPU, np. `cuda:0`; nadpisywane przez `CUDA_VISIBLE_DEVICES` |
+| `--prepare-only`          | `False`             | Wygeneruj splity i zakończ (bez treningu) — do przygotowania danych przed `--resume` |
+| `--resume`                | `False`             | Pomiń seedy już zapisane w pliku wyników (bezpieczne wznawianie po przerwaniu) |
+| `--correction`            | `holm`              | Korekcja wielokrotnych porównań Wilcoxona: `holm` \| `bh`       |
+| `--checkpoints-dir`       | `None`              | Katalog do zapisywania checkpointów modeli po pre-treningu      |
+| `--monitor-metrics`       | `False`             | Loguj dodatkowe metryki diagnostyczne w trakcie treningu         |
 
 ---
 
@@ -230,16 +239,56 @@ Plik JSON zawiera pełną konfigurację CLI (`"config": {...}`) i surowe wartoś
 
 ## Modele i modalności
 
-| Model       | Modalność       | Strategia kontrastowa                                                    |
-|-------------|-----------------|--------------------------------------------------------------------------|
-| `RandomInit`| dowolna         | Brak pre-treningu – baseline (random init kodera + linear readout)       |
-| `TSTCC`     | szeregi         | Temporal + Contextual Contrasting (weak/strong aug + Transformer)        |
-| `SCARF`     | tabelaryczne    | Random Feature Corruption (zamiana wartości kolumn na inne z batcha)     |
-| `SubTab`    | tabelaryczne    | Subsetting kolumn + szum Gaussa, NT-Xent między podzbiorami              |
-| `MoCo`      | obrazy          | Momentum contrast z kolejką negatywnych próbek (InfoNCE)                 |
-| `BYOL`      | obrazy          | Bootstrap your own latent – bez negatywów, predyktor + target EMA, asymetryczne augmentacje |
+| Model                    | Modalność       | Strategia kontrastowa                                                                   |
+|--------------------------|-----------------|-----------------------------------------------------------------------------------------|
+| `RandomInit`             | dowolna         | Brak pre-treningu – baseline (random init kodera + linear readout)                      |
+| `RandomInit-SubTabArch`  | tabelaryczne    | Jak `RandomInit`, ale z **identyczną architekturą AE** co SubTab – porównanie arch-to-arch |
+| `RandomInit` (HAR)       | szeregi czasowe | Jak `RandomInit`, ale z **identyczną architekturą CNN** co TS-TCC                       |
+| `TSTCC`                  | szeregi         | Temporal + Contextual Contrasting (weak/strong aug + Transformer)                       |
+| `SCARF`                  | tabelaryczne    | Random Feature Corruption – dokładnie ⌊c·M⌋ cech na wiersz, wartości z rozkładu brzegowego X_train |
+| `SubTab`                 | tabelaryczne    | Subsetting kolumn + szum, NT-Xent między podzbiorami (jeden wspólny enkoder AE)         |
+| `MoCo`                   | obrazy          | Momentum contrast v2 – kolejka negatywów, głowica MLP bez BN, temperatura 0.2          |
+| `BYOL`                   | obrazy          | Bootstrap your own latent – bez negatywów, predyktor + target EMA z cosine τ schedule  |
+
+**Flaga `--algorithms`** pozwala uruchomić tylko wybrane algorytmy zamiast całego zestawu:
+
+```bash
+# Uruchom tylko MoCo i BYOL na PathMNIST (z pominięciem RandomInit)
+python run_experiments.py --dataset pathmnist --algorithms MoCo BYOL
+
+# Uruchom tylko SCARF na Credit Card
+python run_experiments.py --dataset credit_card --algorithms SCARF
+
+# Sprawdź dostępne algorytmy per dataset — jeśli podasz błędną nazwę, skrypt wypisze dostępne
+python run_experiments.py --dataset uci_har --algorithms foo
+```
+
+Nazwy algorytmów muszą dokładnie pasować do identyfikatorów wewnętrznych:
+`RandomInit`, `RandomInit-SubTabArch`, `TSTCC`, `SCARF`, `SubTab`, `MoCo`, `BYOL`.
 
 Każdy algorytm SSL ma dedykowaną przestrzeń hiperparametrów w [contrastive_framework/hpo.py](contrastive_framework/hpo.py).
+
+---
+
+## Zgodność z oryginalnymi implementacjami
+
+Każda metoda SSL jest zaimplementowana z zachowaniem wierności oryginalnej publikacji lub kodowi
+referencyjnemu. Poniżej zestawienie repozytoriów użytych jako referencja:
+
+| Metoda | Repozytorium referencyjne | Licencja | Gałąź/commit |
+|--------|--------------------------|----------|--------------|
+| MoCo v2 | [facebookresearch/moco](https://github.com/facebookresearch/moco) | CC BY-NC 4.0 | `KaimingHe-patch-2`, `moco/builder.py` |
+| BYOL | [deepmind/deepmind-research/byol](https://github.com/deepmind/deepmind-research/tree/master/byol) | Apache 2.0 | `master`, `byol_experiment.py`, `utils/` |
+| SCARF | arXiv:2106.15147 (Bahri et al., ICLR 2022) | — (brak oficjalnego kodu) | implementacja z artykułu |
+| SubTab | [AstraZeneca/SubTab](https://github.com/AstraZeneca/SubTab) | Apache 2.0 | `main`, `utils/model_utils.py`, `src/model.py` |
+| TS-TCC | [emadeldeen24/TS-TCC](https://github.com/emadeldeen24/TS-TCC) | MIT | `master`, `models/`, `dataloader/` |
+
+Repozytoria sklonowane lokalnie do `third_party_reference/` (w `.gitignore`).
+
+Pełna lista świadomych odstępstw od protokołów oryginalnych (optymalizator, architektura,
+augmentacje, strata, sprzęt) znajduje się w **[docs/DEVIATIONS.md](docs/DEVIATIONS.md)**.
+
+Licencje kodu zewnętrznego: **[THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md)**.
 
 ---
 
@@ -268,6 +317,98 @@ Każdy algorytm SSL ma dedykowaną przestrzeń hiperparametrów w [contrastive_f
 
 ---
 
+## Kaggle, 2×T4
+
+Kaggle udostępnia dwie karty T4 16 GB w trybie „GPU T4 x2" (limit 12 h/sesję).
+Modele są małe — zamiast DDP uruchamiamy **dwa niezależne procesy**, po jednym na kartę,
+z rozdzielonymi seedami.
+
+### Wybór urządzenia
+
+Dwa równoważne sposoby:
+
+```bash
+# Sposób 1 – flaga --device (jawna karta)
+python run_experiments.py --dataset pathmnist --device cuda:0 ...
+python run_experiments.py --dataset pathmnist --device cuda:1 ...
+
+# Sposób 2 – CUDA_VISIBLE_DEVICES (zalecany na Kaggle; pomija --device)
+CUDA_VISIBLE_DEVICES=0 python run_experiments.py --dataset pathmnist ...
+CUDA_VISIBLE_DEVICES=1 python run_experiments.py --dataset pathmnist ...
+```
+
+`CUDA_VISIBLE_DEVICES=0` sprawia że PyTorch widzi tylko pierwszą kartę jako `cuda:0`
+— prostsze w notebookach Kaggle gdzie `%%bash` i `subprocess` dobrze obsługują zmienne
+środowiskowe, a `--device` wymagałoby modyfikacji komendy.
+
+### Gotowa komórka notebooka Kaggle
+
+```bash
+%%bash
+# Krok 0: pobierz dane i wygeneruj splity dla wszystkich seedów (raz, sekwencyjnie)
+python run_experiments.py \
+    --dataset pathmnist --subsample 20000 \
+    --prepare-only --seeds 0 1 2 3 4 5 6 7 8 9
+
+# Krok 1: uruchom dwa procesy równolegle, każdy na swojej karcie
+CUDA_VISIBLE_DEVICES=0 python run_experiments.py \
+    --dataset pathmnist --subsample 20000 \
+    --seeds 0 2 4 6 8 \
+    --results-file results_pathmnist_gpu0.json \
+    --resume > log_gpu0.txt 2>&1 &
+
+CUDA_VISIBLE_DEVICES=1 python run_experiments.py \
+    --dataset pathmnist --subsample 20000 \
+    --seeds 1 3 5 7 9 \
+    --results-file results_pathmnist_gpu1.json \
+    --resume > log_gpu1.txt 2>&1 &
+
+wait  # czekaj aż oba procesy skończą
+
+# Krok 2: scal wyniki w jeden plik i wypisz tabele
+python scripts/merge_results.py \
+    results_pathmnist_gpu0.json results_pathmnist_gpu1.json \
+    --out results_pathmnist.json
+```
+
+Analogicznie dla pozostałych datasetów (zamień `pathmnist` → `uci_har` / `credit_card`
+i dostosuj `--subsample`).
+
+### Podgląd postępu
+
+```bash
+# W osobnej komórce Kaggle lub terminalu:
+tail -f log_gpu0.txt log_gpu1.txt
+
+# Użycie GPU:
+nvidia-smi -l 5    # odświeżaj co 5 s
+```
+
+### Wznawianie po przerwaniu (--resume)
+
+Flaga `--resume` pomija seedy już zapisane w pliku wyników — bezpieczne przy
+wznowieniu po przekroczeniu limitu 12 h lub awarii:
+
+```bash
+# Uruchom ponownie — automatycznie pominie ukończone seedy
+CUDA_VISIBLE_DEVICES=0 python run_experiments.py \
+    --dataset pathmnist --subsample 20000 \
+    --seeds 0 2 4 6 8 \
+    --results-file results_pathmnist_gpu0.json \
+    --resume
+```
+
+Wyniki są zapisywane **po każdym seedzie** (checkpoint), więc wznowienie traci
+co najwyżej jeden seed pracy.
+
+### Spójność wyników między procesami
+
+Każdy seed jest seedowany niezależnie (`torch`, `numpy`, `random`, `optuna`)
+przed wywołaniem `run_one_seed`. Wynik dla seeda N nie zależy od tego,
+na której karcie ani w jakiej kolejności był liczony.
+
+---
+
 ## Struktura projektu
 
 ```
@@ -285,10 +426,16 @@ framework/
 │   └── models/
 │       ├── base.py             # BaseContrastiveModel + build_encoder (mlp/cnn/resnet_like)
 │       │                       # + freeze_encoder() z encoder.eval() + train() override
-│       ├── image_models.py     # MoCo (zawijanie kolejki bez asserta), BYOL (asymetryczne aug)
-│       ├── tabular_models.py   # SCARF (brak self-corruption), SubTab (per-seed subsets)
+│       ├── image_models.py     # MoCo v2 (SplitBN, MLP bez BN, τ=0.2), BYOL (cosine τ, train() target)
+│       ├── tabular_models.py   # SCARF (floor(c·M) korupcja, marginale X_train, InfoNCE τ=1), SubTab+RandomInit-SubTabArch
 │       └── timeseries_models.py # TS-TCC (dynamiczny max_seq_len z seq_len)
 ├── run_experiments.py              # Główny skrypt: HPO → trening → agregacja → Wilcoxon → LaTeX
+├── scripts/
+│   └── merge_results.py            # Scala wyniki z wielu procesów/kart GPU w jeden plik
+├── tests/                          # Testy pytest (CPU, kilka sekund)
+├── docs/
+│   └── DEVIATIONS.md               # Tabela odstępstw od oryginalnych implementacji
+├── THIRD_PARTY_LICENSES.md         # Licencje kodu zewnętrznego
 ├── requirements.txt
 └── README.md
 ```
