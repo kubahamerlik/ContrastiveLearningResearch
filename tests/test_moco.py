@@ -352,3 +352,33 @@ class TestForward:
         for name, param in m.encoder.named_parameters():
             assert param.grad is None, \
                 f"encoder.{name}: nie powinno mieć gradientu gdy zamrożony"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# prefill_queue — opcjonalny, domyślnie wyłączony (punkt 5)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestPrefillQueueFlag:
+    """
+    DEVIATIONS.md: prefill_queue jest opcją domyślnie wyłączoną.
+    MoCoModel musi mieć parametr prefill_queue: bool = False w __init__,
+    a run_experiment/hpo mogą prefillować tylko gdy model.prefill_queue_enabled.
+    """
+
+    def test_moco_has_prefill_flag_default_false(self):
+        """MoCoModel.__init__ ma parametr prefill_queue domyślnie False."""
+        m = make_model()
+        assert hasattr(m, "prefill_queue_enabled"), (
+            "MoCoModel powinien mieć atrybut prefill_queue_enabled"
+        )
+        assert m.prefill_queue_enabled is False, (
+            "prefill_queue domyślnie musi być wyłączone (zgodnie z DEVIATIONS.md)"
+        )
+
+    def test_moco_prefill_flag_can_be_enabled(self):
+        """prefill_queue=True ustawia flagę."""
+        m = MoCoModel(
+            encoder_type="cnn_image", input_dim=3, hidden_dim=64, proj_dim=32,
+            num_classes=10, queue_size=32, bn_splits=1, prefill_queue=True,
+        )
+        assert m.prefill_queue_enabled is True

@@ -140,7 +140,7 @@ def _objective(
             _xs.append(_x)
         model.set_marginals(torch.stack(_xs, dim=0))
 
-    if hasattr(model, "prefill_queue"):
+    if getattr(model, "prefill_queue_enabled", False):
         model.prefill_queue(pretrain_loader)
 
     pretrain(model, pretrain_loader, opt_pre,

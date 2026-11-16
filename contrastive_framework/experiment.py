@@ -555,7 +555,7 @@ def run_experiment(
     )
     pretrain_loader = data_module.pretrain_loader()
 
-    if hasattr(model, "prefill_queue"):
+    if getattr(model, "prefill_queue_enabled", False):
         if verbose:
             print("  [MoCo] Pre-fill kolejki prawdziwymi embeddingami...")
         model.prefill_queue(pretrain_loader)

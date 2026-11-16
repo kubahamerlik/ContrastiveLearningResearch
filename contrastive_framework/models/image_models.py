@@ -101,6 +101,7 @@ class MoCoModel(BaseContrastiveModel):
         momentum: float = 0.999,
         temperature: float = 0.2,
         bn_splits: int = 8,
+        prefill_queue: bool = False,
     ) -> None:
         super().__init__(encoder_type, input_dim, hidden_dim, proj_dim, num_classes)
 
@@ -108,6 +109,9 @@ class MoCoModel(BaseContrastiveModel):
         self.temperature = temperature
         self.queue_size = queue_size
         self.bn_splits = bn_splits
+        # prefill_queue domyślnie wyłączone (zgodnie z MoCo builder.py: losowa inicjalizacja).
+        # Prefill prawdziwymi embeddingami jest opcją dla stabilizacji 1. epoki.
+        self.prefill_queue_enabled = prefill_queue
 
         # Nadpisz projector z BaseContrastiveModel — MoCo v2 używa MLP bez BN
         # Port z builder.py L.31-32: Linear(dim_mlp, dim_mlp) → ReLU → Linear(dim_mlp, dim)
