@@ -75,42 +75,131 @@ def strong_augmentation(
 
 # ===========================================================================
 # Seq_Transformer (Temporal Contrasting)
-# Port z: third_party_reference/TS-TCC/models/attention.py
+# Port 1:1 z: third_party_reference/TS-TCC/models/attention.py
+# Zmiany względem oryginału: brak einops (zastąpione natywnym torch), reszta
+# identyczna: Pre-LN (Residual+PreNorm), scale=dim**-0.5, to_qkv bias=False,
+# dim_feedforward=mlp_dim (NIE mlp_dim*4).
 # ===========================================================================
+
+class _Residual(nn.Module):
+    """Residual wrapper — Port z TS-TCC/models/attention.py."""
+    def __init__(self, fn: nn.Module) -> None:
+        super().__init__()
+        self.fn = fn
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        return self.fn(x, **kwargs) + x
+
+
+class _PreNorm(nn.Module):
+    """Pre-LayerNorm wrapper — Port z TS-TCC/models/attention.py."""
+    def __init__(self, dim: int, fn: nn.Module) -> None:
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.fn = fn
+
+    def forward(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        return self.fn(self.norm(x), **kwargs)
+
+
+class _FeedForward(nn.Module):
+    """FF: dim→hidden_dim→dim z ReLU — Port z TS-TCC/models/attention.py."""
+    def __init__(self, dim: int, hidden_dim: int, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+class _Attention(nn.Module):
+    """Multi-head attention — Port z TS-TCC/models/attention.py.
+    scale=dim**-0.5; to_qkv bias=False (jak w referencji).
+    einops zastąpione natywnym view/permute/einsum."""
+    def __init__(self, dim: int, heads: int = 8, dropout: float = 0.0) -> None:
+        super().__init__()
+        self.heads = heads
+        self.scale = dim ** -0.5
+        self.to_qkv = nn.Linear(dim, dim * 3, bias=False)
+        self.to_out = nn.Sequential(
+            nn.Linear(dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        B, N, D = x.shape
+        h = self.heads
+        qkv = self.to_qkv(x)                        # (B, N, 3*D)
+        qkv = qkv.reshape(B, N, 3, h, D // h)       # (B, N, 3, h, d_h)
+        qkv = qkv.permute(2, 0, 3, 1, 4)            # (3, B, h, N, d_h)
+        q, k, v = qkv[0], qkv[1], qkv[2]            # each: (B, h, N, d_h)
+
+        # dots: (B, h, N, N)
+        dots = torch.einsum("bhid,bhjd->bhij", q, k) * self.scale
+
+        if mask is not None:
+            mask = F.pad(mask.flatten(1), (1, 0), value=True)
+            mask = mask[:, None, :] * mask[:, :, None]
+            dots.masked_fill_(~mask, float("-inf"))
+
+        attn = dots.softmax(dim=-1)
+        out = torch.einsum("bhij,bhjd->bhid", attn, v)  # (B, h, N, d_h)
+        out = out.permute(0, 2, 1, 3).reshape(B, N, D)  # (B, N, D)
+        return self.to_out(out)
+
+
+class _Transformer(nn.Module):
+    """Pre-LN Transformer — Port z TS-TCC/models/attention.py (klasa Transformer).
+    dim_feedforward = mlp_dim (nie mlp_dim*4)."""
+    def __init__(self, dim: int, depth: int, heads: int,
+                 mlp_dim: int, dropout: float) -> None:
+        super().__init__()
+        self.layers = nn.ModuleList([])
+        for _ in range(depth):
+            self.layers.append(nn.ModuleList([
+                _Residual(_PreNorm(dim, _Attention(dim, heads=heads, dropout=dropout))),
+                _Residual(_PreNorm(dim, _FeedForward(dim, mlp_dim, dropout=dropout))),
+            ]))
+
+    def forward(self, x: torch.Tensor,
+                mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        for attn, ff in self.layers:
+            x = attn(x, mask=mask)
+            x = ff(x)
+        return x
+
 
 class _SeqTransformer(nn.Module):
     """
     Transformer z c_token i patch_to_embedding.
     Wejście : (B, T, patch_size)  gdzie patch_size = final_out_channels
     Wyjście : (B, dim)            gdzie dim = tc_hidden_dim
-    Port z: TS-TCC/models/attention.py (Seq_Transformer)
-    patch_to_embedding: Linear(patch_size → dim)  – projekcja wejścia
+    Port 1:1 z: TS-TCC/models/attention.py (Seq_Transformer)
     """
 
     def __init__(self, patch_size: int, dim: int, depth: int = 4, heads: int = 4,
                  mlp_dim: int = 64, dropout: float = 0.1) -> None:
         super().__init__()
-        # Projekcja wejścia: patch_size (= final_out_channels) → dim (= tc_hidden_dim)
         self.patch_to_embedding = nn.Linear(patch_size, dim)
-        # c_token: (1, 1, dim) – learnable
         self.c_token = nn.Parameter(torch.randn(1, 1, dim))
-
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=dim, nhead=heads,
-            dim_feedforward=mlp_dim * 4, dropout=dropout,
-            batch_first=True,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+        self.transformer = _Transformer(dim, depth, heads, mlp_dim, dropout)
+        self.to_c_token = nn.Identity()
         self.dim = dim
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """x: (B, T, patch_size) → c_t: (B, dim)"""
+        x = self.patch_to_embedding(x)              # (B, T, dim)
         B = x.size(0)
-        x = self.patch_to_embedding(x)       # (B, T, dim)
-        c = self.c_token.expand(B, -1, -1)   # (B, 1, dim)
-        x_with_cls = torch.cat([c, x], dim=1)  # (B, T+1, dim)
-        out = self.transformer(x_with_cls)   # (B, T+1, dim)
-        return out[:, 0]                     # c_t: (B, dim)
+        c = self.c_token.expand(B, -1, -1)          # (B, 1, dim)
+        x = torch.cat([c, x], dim=1)                # (B, T+1, dim)
+        x = self.transformer(x)                     # (B, T+1, dim)
+        return self.to_c_token(x[:, 0])             # c_t: (B, dim)
 
 
 # ===========================================================================
