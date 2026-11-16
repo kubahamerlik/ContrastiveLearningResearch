@@ -425,3 +425,92 @@ class TestSCARFPretrainStep:
         x_before = x.clone()
         model.pretrain_step(x)
         assert torch.allclose(x, x_before)
+
+
+# ===========================================================================
+# Testy HPO — SCARF musi mieć marginale podczas HPO trials
+# ===========================================================================
+
+class TestSCARFHPO:
+    """
+    _objective w hpo.py musi wywołać set_marginals() PRZED pretrain dla SCARF.
+    Bez marginals pretrain_step rzuca RuntimeError.
+    """
+
+    def test_scarf_pretrain_step_warns_without_marginals(self):
+        """pretrain_step emituje RuntimeWarning gdy marginals nie są ustawione."""
+        import warnings
+        model = make_model(10, 0.6)
+        # NIE wywołujemy set_marginals
+        x = torch.randn(8, 10)
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            model.pretrain_step(x)
+        messages = [str(warning.message) for warning in w]
+        assert any("argin" in m.lower() for m in messages), (
+            f"Brak ostrzeżenia o brakujących marginals. Otrzymane: {messages}"
+        )
+
+    def test_hpo_objective_calls_set_marginals(self):
+        """
+        _objective powinno wywołać set_marginals dla SCARF zanim uruchomi pretrain.
+        Test: mockujemy DataModule, sprawdzamy że model po HPO trial ma _marginals != None.
+        """
+        import optuna
+        from unittest.mock import MagicMock
+        from contrastive_framework.hpo import _objective
+        from contrastive_framework.models.tabular_models import SCARFModel
+
+        num_features = 10
+        X = torch.randn(64, num_features)
+        y = torch.randint(0, 2, (64,))
+        dataset = torch.utils.data.TensorDataset(X, y)
+
+        # Mock DataModule z minimalnym API
+        dm = MagicMock()
+        dm.train_dataset = dataset
+        dm.pretrain_loader.return_value = torch.utils.data.DataLoader(
+            dataset, batch_size=16
+        )
+        dm.finetune_loader.return_value = torch.utils.data.DataLoader(
+            dataset, batch_size=16
+        )
+        dm.val_loader.return_value = torch.utils.data.DataLoader(
+            dataset, batch_size=16
+        )
+
+        study = optuna.create_study(direction="maximize",
+                                    sampler=optuna.samplers.RandomSampler(seed=0))
+        fixed_kwargs = {"num_features": num_features, "num_classes": 2}
+
+        # Zbieramy modele stworzone przez _objective żeby sprawdzić _marginals
+        created_models = []
+        original_class_call = SCARFModel.__call__
+
+        import warnings
+        # Po wywołaniu _objective pretrain nie może dać RuntimeWarning o brakujących marginals
+        warnings_seen = []
+
+        def objective(trial):
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                result = _objective(
+                    trial=trial,
+                    model_class=SCARFModel,
+                    fixed_model_kwargs=fixed_kwargs,
+                    data_module=dm,
+                    pretrain_epochs=1,
+                    finetune_epochs=1,
+                    finetune_fraction=1.0,
+                    device=torch.device("cpu"),
+                )
+            marginals_warnings = [str(x.message) for x in w
+                                   if "argin" in str(x.message).lower()]
+            warnings_seen.extend(marginals_warnings)
+            return result
+
+        study.optimize(objective, n_trials=1, show_progress_bar=False)
+
+        assert not warnings_seen, (
+            f"_objective uruchomiło pretrain SCARF bez set_marginals: {warnings_seen}"
+        )

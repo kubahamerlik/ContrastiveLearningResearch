@@ -128,6 +128,18 @@ def _objective(
                                      warmup_epochs=max(1, pretrain_epochs // 10))
 
     pretrain_loader = data_module.pretrain_loader()
+
+    # SCARF: marginale treningowe muszą być ustawione przed HPO trial (nie tylko finalnym
+    # treningiem). Bez tego korupcja używa wartości z bieżącego batcha (data leakage + niska
+    # jakość augmentacji w pierwszym batchu).
+    if hasattr(model, "set_marginals"):
+        _train_ds = data_module.train_dataset
+        _xs: list = []
+        for _item in _train_ds:
+            _x = _item[0] if isinstance(_item, (list, tuple)) else _item
+            _xs.append(_x)
+        model.set_marginals(torch.stack(_xs, dim=0))
+
     if hasattr(model, "prefill_queue"):
         model.prefill_queue(pretrain_loader)
 
