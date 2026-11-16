@@ -249,7 +249,7 @@ def load_credit_card_fraud(
     X = torch.from_numpy(X_np).float()
     y = torch.from_numpy(y_np).long()
 
-    fraud_rate = float((y == 1).sum().item() / y.numel())
+    fraud_rate_original = float((y == 1).sum().item() / y.numel())
 
     if subsample is not None and subsample < X.shape[0]:
         # Specjalny tryb: zachowaj WSZYSTKIE fraudy + losowy podzbiór normal
@@ -269,12 +269,17 @@ def load_credit_card_fraud(
         combined = combined[torch.randperm(combined.numel(), generator=g)]
         X, y = X[combined], y[combined]
 
+    # fraud_rate_effective: po subsamplingu (y może już być mniejszy)
+    fraud_rate_effective = float((y == 1).sum().item() / y.numel())
+
     meta = {
         "num_features": 30,
         "num_classes": 2,
         "class_names": ["normal", "fraud"],
         "shape": tuple(X.shape),
-        "fraud_rate": fraud_rate,
+        "fraud_rate": fraud_rate_original,          # backward compat
+        "fraud_rate_original": fraud_rate_original,  # przed subsamplingiem
+        "fraud_rate_effective": fraud_rate_effective, # po subsamplingu
         "normalize_cols": [0, 29],  # Time i Amount — V1..V28 już znorm. przez PCA
     }
     return X, y, meta

@@ -918,7 +918,10 @@ def main() -> None:
     subsample_info = f" → subsample={args.subsample}/seed" if args.subsample else ""
     print(f"  shape (pełny): {meta['shape']}{subsample_info}")
     print(f"  klas  : {meta['num_classes']} ({meta.get('class_names', [])})")
-    if "fraud_rate" in meta:
+    if "fraud_rate_original" in meta:
+        print(f"  fraud_rate_original : {meta['fraud_rate_original']:.4%} (pełny zbiór)")
+        print(f"  fraud_rate_effective: {meta.get('fraud_rate_effective', float('nan')):.4%} (po subsamplingu)")
+    elif "fraud_rate" in meta:
         print(f"  fraud_rate: {meta['fraud_rate']:.4%}")
 
     algorithms = [
