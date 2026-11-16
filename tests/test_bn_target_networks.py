@@ -253,3 +253,68 @@ class TestSplitBatchNorm:
         x = torch.rand(4, 4, 2, 2)  # B=4 < num_splits=8
         out = bn(x)
         assert out.shape == x.shape
+
+    def test_split_bn_differs_from_regular_bn(self):
+        """
+        SplitBN musi dawać INNE wyniki niż zwykły BN dla batcha z bimodalną
+        strukturą (dwie grupy próbek o różnych średnich).
+
+        Jeśli SplitBN liczyłoby statystyki z całego batcha (jak zwykły BN),
+        wyjście byłoby identyczne.
+        """
+        from contrastive_framework.models.base import SplitBatchNorm2d
+        torch.manual_seed(0)
+        C, H, W = 8, 4, 4
+
+        # Batch bimodalny: pierwsza połowa ma wartości ~0, druga ~10
+        # Zwykły BN znormalizuje względem global_mean≈5
+        # SplitBN (2 splity) znormalizuje każdą połowę osobno względem jej własnej średniej
+        x = torch.zeros(16, C, H, W)
+        x[:8] = torch.randn(8, C, H, W) * 0.1          # ~N(0, 0.1)
+        x[8:] = torch.randn(8, C, H, W) * 0.1 + 10.0   # ~N(10, 0.1)
+
+        split_bn = SplitBatchNorm2d(C, num_splits=2)
+        split_bn.train()
+        split_bn.weight.data.fill_(1.0)
+        split_bn.bias.data.fill_(0.0)
+
+        regular_bn = torch.nn.BatchNorm2d(C)
+        regular_bn.train()
+        regular_bn.weight.data.fill_(1.0)
+        regular_bn.bias.data.fill_(0.0)
+
+        out_split = split_bn(x)
+        out_regular = regular_bn(x)
+
+        max_diff = (out_split - out_regular).abs().max().item()
+        assert max_diff > 0.5, (
+            f"SplitBN daje wynik identyczny ze zwykłym BN (max_diff={max_diff:.6f}). "
+            "SplitBN powinno liczyć statystyki osobno dla każdego splitu, "
+            "co dla bimodalnego batcha daje różny wynik od globalnego BN."
+        )
+
+    def test_split_bn_each_split_normalized(self):
+        """
+        Każdy split po SplitBN powinien mieć mean≈0, std≈1.
+        Zwykły BN dałby globalne mean=0 ale per-split mean byłoby różne od 0.
+        """
+        from contrastive_framework.models.base import SplitBatchNorm2d
+        torch.manual_seed(42)
+        C, H, W = 4, 4, 4
+        num_splits = 2
+
+        x = torch.zeros(16, C, H, W)
+        x[:8] = torch.randn(8, C, H, W) + 5.0
+        x[8:] = torch.randn(8, C, H, W) - 5.0
+
+        split_bn = SplitBatchNorm2d(C, num_splits=num_splits)
+        split_bn.train()
+        split_bn.weight.data.fill_(1.0)
+        split_bn.bias.data.fill_(0.0)
+        out = split_bn(x)
+
+        # Sprawdź że każda połowa ma mean≈0
+        mean_split0 = out[:8].mean().abs().item()
+        mean_split1 = out[8:].mean().abs().item()
+        assert mean_split0 < 0.1, f"Split 0: mean={mean_split0:.4f}, oczekiwano ≈0"
+        assert mean_split1 < 0.1, f"Split 1: mean={mean_split1:.4f}, oczekiwano ≈0"

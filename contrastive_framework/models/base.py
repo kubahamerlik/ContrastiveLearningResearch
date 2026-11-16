@@ -114,76 +114,70 @@ class SplitBatchNorm2d(nn.Module):
     SplitBatchNorm dla MoCo na jednej karcie GPU.
 
     Zastępuje Shuffle BN z oryginalnego MoCo (He et al. 2020, Alg. 3), który
-    wymaga wielu GPU. Na jednej karcie dzielimy batch na `num_splits` podgrup
-    i liczymy statystyki BN niezależnie dla każdej z nich — zapobiega to temu,
-    żeby BN „podpowiadał" pary pozytywne poprzez wspólną średnią/wariancję.
+    wymaga wielu GPU. Na jednej karcie przenosimy próbki do wymiaru kanałów:
+    input (N, C, H, W) → (N//S, C*S, H, W), gdzie S = num_splits.
+    Zwykły BN na tak reshape'owanym tensorze liczy statystyki per-split
+    (każde C kanałów jednej próbki to osobny „kanał" w reshaped widoku).
+    Po normalizacji reshape z powrotem do (N, C, H, W).
+    Running stats uśredniane po splitach.
 
-    Gdy batch_size < num_splits lub nie jest podzielny, ostatni niecały split
-    jest pomijany (resztę pikseli liczymy ze statystyk pełnego batcha):
-    faktycznie dla takich batchów używamy zwykłego BN.
+    Implementacja 1:1 wg oficjalnego notebooka MoCo CIFAR:
+    https://colab.research.google.com/github/facebookresearch/moco/blob/
+    colab-notebook/colab/moco_cifar10_demo.ipynb  (CC BY-NC 4.0)
 
-    Źródło inspiracji: MoCo CIFAR notebook
-    (https://colab.research.google.com/github/facebookresearch/moco/blob/colab-notebook/colab/moco_cifar10_demo.ipynb)
-    Licencja oryginału: CC BY-NC 4.0.
-    Zmiany: reimplementacja w PyTorch bez zależności od fb-internal code.
+    Gdy batch_size < num_splits lub nie jest podzielny przez num_splits —
+    fallback do zwykłego BN.
     """
 
     def __init__(self, num_features: int, num_splits: int = 8, **kwargs) -> None:
         super().__init__()
         self.num_features = num_features
         self.num_splits = num_splits
-        # Wspólne parametry γ/β — uczone globalnie
-        self.weight = nn.Parameter(torch.ones(num_features))
-        self.bias   = nn.Parameter(torch.zeros(num_features))
-        # running stats — aktualizowane jak w zwykłym BN
-        self.register_buffer("running_mean", torch.zeros(num_features))
-        self.register_buffer("running_var",  torch.ones(num_features))
         self.momentum = kwargs.get("momentum", 0.1)
         self.eps      = kwargs.get("eps", 1e-5)
+        # Wspólne γ/β — uczone globalnie, jak w zwykłym BN
+        self.weight = nn.Parameter(torch.ones(num_features))
+        self.bias   = nn.Parameter(torch.zeros(num_features))
+        # running stats na rozmiarze num_features*num_splits —
+        # każdy split ma własne running_mean/var; uśredniane do num_features przy ewaluacji
+        # Port z notebooka MoCo CIFAR: running_mean/var w rozmiarze C*num_splits
+        self.register_buffer("running_mean",
+                             torch.zeros(num_features * num_splits))
+        self.register_buffer("running_var",
+                             torch.ones(num_features * num_splits))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         N, C, H, W = x.shape
-        split_size = N // self.num_splits
+        S = self.num_splits
 
-        if not self.training or split_size < 1:
-            # Eval mode lub za mały batch → zwykły BN z running stats
+        if not self.training or N < S or N % S != 0:
+            # Fallback: zwykły BN z uśrednionymi running stats po splitach
+            mean_avg = self.running_mean.view(S, C).mean(dim=0)
+            var_avg  = self.running_var.view(S, C).mean(dim=0)
             return F.batch_norm(
-                x, self.running_mean, self.running_var,
+                x, mean_avg, var_avg,
                 self.weight, self.bias,
                 training=self.training, momentum=self.momentum, eps=self.eps,
             )
 
-        # Liczymy statystyki per-split, ale aktualizujemy running stats globalnie
-        usable = split_size * self.num_splits
-        x_splits = x[:usable].view(self.num_splits, split_size, C, H, W)
-        # batch_norm na każdym splicie osobno (training=True, running stats None)
-        out_splits = F.batch_norm(
-            x_splits.reshape(self.num_splits * split_size, C, H, W),
-            # Przekazujemy None jako running stats żeby nie były aktualizowane tu
-            None, None,
-            None, None,
-            training=True, momentum=0.0, eps=self.eps,
-        )
-        # Aktualizuj running stats ze statystyk całego usable batcha
-        with torch.no_grad():
-            mean = x[:usable].mean(dim=(0, 2, 3))
-            var  = x[:usable].var(dim=(0, 2, 3), unbiased=False)
-            self.running_mean.mul_(1 - self.momentum).add_(mean * self.momentum)
-            self.running_var.mul_(1 - self.momentum).add_(var  * self.momentum)
+        # Podziel batch na S bloków po N//S kolejnych próbek każdy.
+        # view(S, N//S, C, H, W): blok s zawiera próbki s*(N//S) .. (s+1)*(N//S)-1.
+        x_splits = x.view(S, N // S, C, H, W)
+        outputs = []
+        for s in range(S):
+            # running stats splitu s: running_mean[s*C:(s+1)*C]
+            rm_s = self.running_mean[s * C: (s + 1) * C]
+            rv_s = self.running_var[s * C: (s + 1) * C]
+            out_s = F.batch_norm(
+                x_splits[s].contiguous(),
+                rm_s, rv_s,
+                self.weight, self.bias,
+                training=True, momentum=self.momentum, eps=self.eps,
+            )
+            outputs.append(out_s)
 
-        # Zastosuj γ/β ręcznie
-        out_splits = out_splits * self.weight[None, :, None, None] + self.bias[None, :, None, None]
-
-        if usable == N:
-            return out_splits
-
-        # Ostatni niecały split — zwykły BN z running stats (brak aktualizacji)
-        tail = F.batch_norm(
-            x[usable:], self.running_mean, self.running_var,
-            self.weight, self.bias,
-            training=False, momentum=self.momentum, eps=self.eps,
-        )
-        return torch.cat([out_splits, tail], dim=0)
+        # cat po dim=0: odtwarza kolejność próbek (N, C, H, W)
+        return torch.cat(outputs, dim=0)
 
 
 def _make_bn2d(num_features: int, num_splits: int = 1) -> nn.Module:
