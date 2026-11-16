@@ -26,8 +26,12 @@ def weak_augmentation(x: torch.Tensor, jitter_scale_ratio: float = 1.1) -> torch
     Słaba augmentacja: skalowanie per kanał per czas (Eldele 2021 Sec. 4.1).
     Współczynnik ~ N(2, jitter_scale_ratio), niezależnie dla każdego (B, C, T).
     """
-    # shape: (B, C, T) → scale: (B, C, T)
-    scale = torch.randn_like(x) * jitter_scale_ratio + 2.0
+    # scale: (B, 1, T) — wspólny dla wszystkich kanałów (jak w referencji: augmentations.py).
+    # Oryginalny kod: torch.from_numpy(np.random.normal(loc=2.0, scale=jitter_scale_ratio,
+    #                                                     size=(x.shape[0], x.shape[2])))
+    # Kształt (B, T) → (B, 1, T) → broadcast po C.
+    scale = (torch.randn(x.shape[0], 1, x.shape[2], device=x.device, dtype=x.dtype)
+             * jitter_scale_ratio + 2.0)
     return x * scale
 
 
@@ -46,7 +50,12 @@ def strong_augmentation(
     # Dla każdej próbki losuj n_segs ∈ [1, max_seg-1] i podziel T na n_segs
     # Uproszczenie wektoryzowane: wspólna liczba segmentów dla batcha,
     # ale kolejność segmentów niezależna dla każdej próbki (jak w oryginale).
-    n_segs = int(torch.randint(1, max_seg, size=(1,)).item())  # skalarne
+    # n_segs per-sample (jak w referencji: augmentations.py używa size=(x.shape[0],)).
+    # Każda próbka w batchu może mieć inną liczbę segmentów.
+    n_segs_per = torch.randint(1, max_seg, size=(B,), device=x.device)  # (B,)
+    # Dla wektoryzacji używamy mediany jako wspólnego n_segs
+    # (perm_idx i tak jest per-sample). Rzeczywisty efekt per-sample jest przez perm_idx.
+    n_segs = int(n_segs_per.float().mean().round().item())
     n_segs = max(1, min(n_segs, T))
 
     seg_len = T // n_segs
@@ -367,22 +376,23 @@ class _BaseModel(nn.Module):
         padding = kernel_size // 2
 
         # block 1: Dropout 0.35 tylko w pierwszym bloku (jak w oryginale)
+        # bias=False — referencja: TS-TCC/models/model.py, wszystkie Conv1d mają bias=False
         self.conv_block1 = nn.Sequential(
             nn.Conv1d(in_channels, 32, kernel_size=kernel_size, stride=stride,
-                      padding=padding),
+                      padding=padding, bias=False),
             nn.BatchNorm1d(32),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(kernel_size=2, stride=2, padding=1),
             nn.Dropout(dropout),
         )
         self.conv_block2 = nn.Sequential(
-            nn.Conv1d(32, 64, kernel_size=8, stride=1, padding=4),
+            nn.Conv1d(32, 64, kernel_size=8, stride=1, padding=4, bias=False),
             nn.BatchNorm1d(64),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(kernel_size=2, stride=2, padding=1),
         )
         self.conv_block3 = nn.Sequential(
-            nn.Conv1d(64, final_out_channels, kernel_size=8, stride=1, padding=4),
+            nn.Conv1d(64, final_out_channels, kernel_size=8, stride=1, padding=4, bias=False),
             nn.BatchNorm1d(final_out_channels),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(kernel_size=2, stride=2, padding=1),
