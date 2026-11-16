@@ -110,6 +110,8 @@ class SCARFModel(BaseContrastiveModel):
         # Ustawiane przez set_marginals() PRZED trenowaniem.
         # Przechowujemy jako bufor (nie parametr), żeby był przenoszony razem z modelem.
         self._marginals: Optional[torch.Tensor] = None
+        # Cache marginals na bieżącym device — unikamy .to(device) przy każdym kroku.
+        self._marginals_cache: Optional[torch.Tensor] = None
 
     def set_marginals(self, train_data: torch.Tensor) -> None:
         """
@@ -131,6 +133,7 @@ class SCARFModel(BaseContrastiveModel):
             )
         # Przechowuj jako CPU tensor (może być duży; przenoszony do device w _corrupt)
         self._marginals = train_data.detach().cpu()
+        self._marginals_cache = None  # wymusi ponowne przeniesienie przy następnym _corrupt
 
     def _corrupt(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -156,14 +159,27 @@ class SCARFModel(BaseContrastiveModel):
         if self._marginals is not None:
             # Optymalna ścieżka: próbki z empirycznych rozkładów brzegowych X_train
             # Port z Algorithm 1 linia 2: X̂_j = {x_j : x ∈ X_train}
-            marginals = self._marginals.to(device)
+            #
+            # Cache marginals na device — przenoszenie tylko przy zmianie device lub
+            # po set_marginals(); _marginals pozostaje zawsze na CPU.
+            if (self._marginals_cache is None
+                    or self._marginals_cache.device != device):
+                self._marginals_cache = self._marginals.to(device)
+            marginals = self._marginals_cache
             N_train = marginals.shape[0]
-            for i in range(B):
-                # Wybierz q cech bez powtórzeń (uniform)
-                cols = torch.randperm(M, device=device)[:q]
-                # Dla każdej wybranej cechy j: próbkuj v ~ X̂_j
-                row_indices = torch.randint(0, N_train, (q,), device=device)
-                x_tilde[i, cols] = marginals[row_indices, cols]
+
+            # Wektoryzacja:
+            # cols[i] = q indeksów kolumn bez powtórzeń dla wiersza i
+            # Trick: argsort(rand(B,M)) daje losową permutację kolumn; bierzemy pierwsze q
+            cols = torch.argsort(
+                torch.rand(B, M, device=device), dim=1
+            )[:, :q]                                            # (B, q)
+            # row_indices[i, j] = indeks wiersza w marginals dla i-tej próbki, j-tej kolumny
+            row_indices = torch.randint(0, N_train, (B, q), device=device)  # (B, q)
+            # Wartości zastępcze: marginals[row_indices[i,j], cols[i,j]] dla każdego (i,j)
+            repl_vals = marginals[row_indices, cols]            # (B, q) — zaawansowane indeksowanie
+            # Scatter wartości do x_tilde
+            x_tilde.scatter_(1, cols, repl_vals)
         else:
             # Fallback (bez set_marginals): losuj wartości z bieżącego batcha.
             # Odstępstwo od artykułu — wartości zastępcze z batcha, nie z X_train.
@@ -178,15 +194,16 @@ class SCARFModel(BaseContrastiveModel):
             )
             if B < 2:
                 return x.clone()
-            for i in range(B):
-                cols = torch.randperm(M, device=device)[:q]
-                # Losuj dawcę różnego od wiersza i
-                donor_pool = torch.arange(B, device=device)
-                donor_pool = donor_pool[donor_pool != i]
-                donor_indices = donor_pool[
-                    torch.randint(0, B - 1, (q,), device=device)
-                ]
-                x_tilde[i, cols] = x[donor_indices, cols]
+            cols = torch.argsort(
+                torch.rand(B, M, device=device), dim=1
+            )[:, :q]                                            # (B, q)
+            # Dawcy: losowe wiersze z batcha różne od własnego wiersza.
+            # Trick: losujemy z B-1 możliwości, potem przesuwamy ≥ własny indeks o +1.
+            raw = torch.randint(0, B - 1, (B, q), device=device)
+            row_idx = torch.arange(B, device=device).unsqueeze(1)  # (B, 1)
+            donor_rows = torch.where(raw >= row_idx, raw + 1, raw)  # (B, q)
+            repl_vals = x[donor_rows, cols]
+            x_tilde.scatter_(1, cols, repl_vals)
 
         return x_tilde
 

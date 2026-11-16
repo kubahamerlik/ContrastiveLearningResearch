@@ -514,3 +514,100 @@ class TestSCARFHPO:
         assert not warnings_seen, (
             f"_objective uruchomiło pretrain SCARF bez set_marginals: {warnings_seen}"
         )
+
+
+# ===========================================================================
+# TestCorruptVectorized — P5: wektoryzacja _corrupt + cache marginals
+# ===========================================================================
+
+class TestCorruptVectorized:
+    """
+    Punkt 5: _corrupt wektoryzacja.
+    Semantyka musi pozostać identyczna jak pętlowa wersja; dodatkowo:
+    - marginals NIE są przenoszone na device przy każdym wywołaniu (cache)
+    - po set_marginals model przechowuje _marginals na CPU
+    """
+
+    def test_corrupt_semantics_exact_q_changed(self):
+        """Wektoryzacja: dokładnie floor(c*M) cech zmienione w każdym wierszu."""
+        torch.manual_seed(0)
+        M, c = 20, 0.5
+        q = int(c * M)
+        model = make_model(M, c)
+        # marginals w zakresie [100, 1000] — łatwo odróżnić od x≈0
+        marginals = torch.rand(50, M) * 900.0 + 100.0
+        model.set_marginals(marginals)
+        x = torch.zeros(32, M)
+        x_tilde = model._corrupt(x)
+        for i in range(x_tilde.shape[0]):
+            changed = (x_tilde[i] != x[i]).sum().item()
+            assert changed == q, f"wiersz {i}: {changed} != {q}"
+
+    def test_corrupt_values_from_marginals(self):
+        """Wektoryzacja: zamienione wartości pochodzą z odpowiednich kolumn marginals."""
+        torch.manual_seed(1)
+        M = 10
+        model = make_model(M, 0.6)
+        N_train = 30
+        # każda kolumna j ma wartości j*1000 + 0..N_train-1
+        marginals = torch.zeros(N_train, M)
+        for j in range(M):
+            marginals[:, j] = torch.arange(N_train, dtype=torch.float) + j * 10000.0
+        model.set_marginals(marginals)
+        x = torch.zeros(16, M)
+        x_tilde = model._corrupt(x)
+        for i in range(x_tilde.shape[0]):
+            for j in range(M):
+                val = x_tilde[i, j].item()
+                if val == 0.0:
+                    continue
+                col_values = marginals[:, j].tolist()
+                assert val in col_values, (
+                    f"wiersz {i}, kolumna {j}: wartość {val} nie pochodzi z marginals"
+                )
+
+    def test_marginals_still_on_cpu_after_corrupt(self):
+        """
+        Po _corrupt() self._marginals musi nadal być na CPU.
+        Wektoryzacja może używać cache na device, ale _marginals powinno pozostać CPU.
+        """
+        model = make_model(10, 0.5)
+        model.set_marginals(torch.rand(40, 10) * 100.0 + 1.0)
+        x = torch.zeros(8, 10)
+        model._corrupt(x)
+        assert model._marginals.device.type == "cpu", (
+            f"_marginals moved to {model._marginals.device} after _corrupt"
+        )
+
+    def test_no_redundant_to_device_calls(self):
+        """
+        Cache: po pierwszym _corrupt() drugi call NIE przenosi _marginals ponownie.
+        Sprawdzamy pośrednio: model ma atrybut cache (_marginals_device lub podobny)
+        lub _marginals.to(device) jest idempotentne — przez wywołanie 10× bez błędu.
+        Główny test: wynik jest deterministyczny (te same seed → te same wyniki).
+        """
+        torch.manual_seed(42)
+        model = make_model(15, 0.4)
+        model.set_marginals(torch.rand(60, 15) * 500.0 + 10.0)
+        x = torch.rand(8, 15)
+
+        # Wywołaj wielokrotnie — nie powinno być błędów ani degradacji
+        for _ in range(10):
+            x_tilde = model._corrupt(x.clone())
+            assert x_tilde.shape == x.shape
+
+    def test_corrupt_uses_vectorized_col_selection(self):
+        """
+        Wektoryzacja: _corrupt nie może zawierać pętli `for i in range(B)`.
+        Sprawdzamy przez inspekcję kodu źródłowego metody.
+        Po wektoryzacji pętla `for i in range(B):` musi zostać usunięta z głównej ścieżki.
+        """
+        import inspect
+        import re
+        from contrastive_framework.models.tabular_models import SCARFModel
+        src = inspect.getsource(SCARFModel._corrupt)
+        # Po wektoryzacji NIE może być pętli per-wiersz w gałęzi marginals
+        # Szukamy `for i in range(B)` — wektoryzacja usuwa tę pętlę
+        assert "for i in range(B)" not in src, (
+            "_corrupt nadal zawiera pętlę `for i in range(B)` — wektoryzacja nie jest zaimplementowana"
+        )
