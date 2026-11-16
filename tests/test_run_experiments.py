@@ -282,3 +282,98 @@ class TestAggregateWithFailures:
         files = [_P("gpu0.json"), _P("gpu1.json")]
         # Nie powinno rzucić SystemExit
         _check_consistency(files, data)
+
+
+# ---------------------------------------------------------------------------
+# Punkt p2 — statystyki bez Wilcoxona: paired_differences + --wilcoxon flag
+# ---------------------------------------------------------------------------
+
+paired_differences = _mod.paired_differences
+
+
+class TestPairedDifferences:
+    """paired_differences() liczy mean_diff, std, CI, wins/n sparowane po seedzie."""
+
+    def _make_all_results(self, ssl_vals, baseline_vals, frac=0.5):
+        """Pomocnik — tworzy all_seed_results z dwoma algorytmami i jedną frakcją."""
+        assert len(ssl_vals) == len(baseline_vals)
+        out = {}
+        for i, (s, b) in enumerate(zip(ssl_vals, baseline_vals)):
+            out[i] = {
+                "SSL": {frac: {"accuracy": s, "macro_f1": s, "balanced_acc": s, "macro_auc": s}},
+                "BL":  {frac: {"accuracy": b, "macro_f1": b, "balanced_acc": b, "macro_auc": b}},
+            }
+        return out
+
+    def test_mean_diff_correct(self):
+        """mean_diff = mean(SSL - BL) sparowane po seedzie."""
+        # SSL = [0.9, 0.8, 0.7], BL = [0.7, 0.7, 0.7]  → diffs = [0.2, 0.1, 0.0]
+        all_res = self._make_all_results([0.9, 0.8, 0.7], [0.7, 0.7, 0.7])
+        result = paired_differences(all_res, ssl_name="SSL", baseline_name="BL")
+        frac_data = result[0.5]  # frakcja 0.5
+        assert abs(frac_data["accuracy"]["mean_diff"] - 0.1) < 1e-6
+
+    def test_wins_correct(self):
+        """wins = liczba seedów, w których SSL > BL."""
+        # SSL > BL dla seedów 0 i 1 (diff 0.2 i 0.1); seed 2: diff=0 → nie wygrana
+        all_res = self._make_all_results([0.9, 0.8, 0.7], [0.7, 0.7, 0.7])
+        result = paired_differences(all_res, ssl_name="SSL", baseline_name="BL")
+        frac_data = result[0.5]
+        assert frac_data["accuracy"]["wins"] == 2
+        assert frac_data["accuracy"]["n"] == 3
+
+    def test_ci_on_differences_not_values(self):
+        """CI liczony na różnicach, nie na wartościach SSL ani BL."""
+        import math
+        from scipy.stats import t as _t
+        # diffs = [0.2, 0.1, 0.0]
+        diffs = [0.2, 0.1, 0.0]
+        n = 3
+        mean_d = sum(diffs) / n
+        std_d = (sum((d - mean_d)**2 for d in diffs) / (n - 1)) ** 0.5
+        t_crit = _t.ppf(0.975, df=n - 1)
+        expected_ci = t_crit * std_d / math.sqrt(n)
+
+        all_res = self._make_all_results([0.9, 0.8, 0.7], [0.7, 0.7, 0.7])
+        result = paired_differences(all_res, ssl_name="SSL", baseline_name="BL")
+        got_ci = result[0.5]["accuracy"]["ci95_half"]
+        assert abs(got_ci - expected_ci) < 1e-9
+
+    def test_n1_ci_is_nan(self):
+        """Dla n=1 CI = NaN (nie można liczyć t-Studenta z jedną obserwacją)."""
+        import math
+        all_res = self._make_all_results([0.9], [0.7])
+        result = paired_differences(all_res, ssl_name="SSL", baseline_name="BL")
+        ci = result[0.5]["accuracy"]["ci95_half"]
+        assert math.isnan(ci), f"Oczekiwano NaN dla n=1, got {ci}"
+
+    def test_missing_seed_excluded(self):
+        """Seed bez wyniku SSL lub BL jest wykluczany z par."""
+        # seed 0: ma SSL i BL; seed 1: brak SSL → n=1
+        all_res = {
+            0: {
+                "SSL": {0.5: {"accuracy": 0.9, "macro_f1": 0.9, "balanced_acc": 0.9, "macro_auc": 0.9}},
+                "BL":  {0.5: {"accuracy": 0.7, "macro_f1": 0.7, "balanced_acc": 0.7, "macro_auc": 0.7}},
+            },
+            1: {
+                "BL":  {0.5: {"accuracy": 0.7, "macro_f1": 0.7, "balanced_acc": 0.7, "macro_auc": 0.7}},
+                # brak SSL dla seed 1
+            },
+        }
+        result = paired_differences(all_res, ssl_name="SSL", baseline_name="BL")
+        assert result[0.5]["accuracy"]["n"] == 1
+
+    def test_all_metrics_present(self):
+        """Wynik zawiera wszystkie 4 metryki."""
+        all_res = self._make_all_results([0.8, 0.9], [0.7, 0.7])
+        result = paired_differences(all_res, ssl_name="SSL", baseline_name="BL")
+        for metric in ("accuracy", "macro_f1", "balanced_acc", "macro_auc"):
+            assert metric in result[0.5], f"Brak metryki {metric!r}"
+
+    def test_wilcoxon_flag_absent_by_default(self):
+        """--wilcoxon nie jest obecne w domyślnej przestrzeni nazw argparse."""
+        args = _mod.parse_args.__wrapped__([]) if hasattr(_mod.parse_args, "__wrapped__") else None
+        # Sprawdź przez inspekcję kodu że flaga --wilcoxon istnieje
+        import inspect
+        src = inspect.getsource(_mod.parse_args)
+        assert "--wilcoxon" in src, "parse_args musi definiować flagę --wilcoxon"

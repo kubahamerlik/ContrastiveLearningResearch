@@ -65,6 +65,8 @@ from contrastive_framework.datasets import (
 
 LABEL_FRACTIONS = [0.0625, 0.125, 0.25, 0.5, 1.0]
 
+METRICS = ["accuracy", "macro_f1", "balanced_acc", "macro_auc"]
+
 
 # ===========================================================================
 # DATASET_CONFIG – per modalność: loader + fabryka DataModule + algorytmy
@@ -87,6 +89,7 @@ DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
             {
                 "name": "TSTCC",
                 "model_class": TSTCCModel,
+                "baseline": "RandomInit",
                 "fixed_kwargs_from_meta": lambda m: {
                     "seq_len":     m["seq_len"],
                     "in_channels": m["in_channels"],
@@ -112,14 +115,7 @@ DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
             {
                 "name": "SCARF",
                 "model_class": SCARFModel,
-                "fixed_kwargs_from_meta": lambda m: {
-                    "num_features": m["num_features"],
-                    "num_classes":  m["num_classes"],
-                },
-            },
-            {
-                "name": "SubTab",
-                "model_class": SubTabModel,
+                "baseline": "RandomInit",
                 "fixed_kwargs_from_meta": lambda m: {
                     "num_features": m["num_features"],
                     "num_classes":  m["num_classes"],
@@ -128,6 +124,15 @@ DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
             {
                 "name": "RandomInit-SubTabArch",
                 "model_class": RandomInitSubTabArchModel,
+                "fixed_kwargs_from_meta": lambda m: {
+                    "num_features": m["num_features"],
+                    "num_classes":  m["num_classes"],
+                },
+            },
+            {
+                "name": "SubTab",
+                "model_class": SubTabModel,
+                "baseline": "RandomInit-SubTabArch",
                 "fixed_kwargs_from_meta": lambda m: {
                     "num_features": m["num_features"],
                     "num_classes":  m["num_classes"],
@@ -151,6 +156,7 @@ DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
             {
                 "name": "MoCo",
                 "model_class": MoCoModel,
+                "baseline": "RandomInit",
                 "fixed_kwargs_from_meta": lambda m: {
                     "encoder_type": "cnn_image",
                     "input_dim":    m["in_channels"],
@@ -160,6 +166,7 @@ DATASET_CONFIG: Dict[str, Dict[str, Any]] = {
             {
                 "name": "BYOL",
                 "model_class": BYOLModel,
+                "baseline": "RandomInit",
                 "fixed_kwargs_from_meta": lambda m: {
                     "encoder_type": "cnn_image",
                     "input_dim":    m["in_channels"],
@@ -462,17 +469,110 @@ def _ci95_half(values: List[float]) -> float:
     import math
     n = len(values)
     if n < 2:
-        return 0.0
+        return float("nan")
     std = _std(values)
     t_crit = float(student_t.ppf(0.975, df=n - 1))
     return t_crit * std / math.sqrt(n)
 
 
 # ===========================================================================
-# 3. Test Wilcoxona vs baseline
+# 3a. Różnice sparowane SSL − baseline
 # ===========================================================================
 
-def wilcoxon_vs_baseline(
+def paired_differences(
+    all_seed_results: Dict[int, Dict[str, Any]],
+    ssl_name: str,
+    baseline_name: str,
+) -> Dict[float, Dict[str, Any]]:
+    """
+    Liczy różnice sparowane SSL − baseline per frakcja × metryka.
+
+    Zwraca:
+        {frac: {metric: {mean_diff, std_diff, ci95_half, ci95_low, ci95_high,
+                          wins, n, diffs}}}
+    Seedy bez wyniku SSL lub baseline są wykluczone z par (n zmniejszone).
+    """
+    import math
+
+    # Zbierz pary per (frac, metric)
+    raw: Dict[float, Dict[str, List[float]]] = {}
+    for seed_res in all_seed_results.values():
+        ssl_data = seed_res.get(ssl_name)
+        bl_data  = seed_res.get(baseline_name)
+        if ssl_data is None or bl_data is None:
+            continue
+        for frac in ssl_data:
+            if frac not in bl_data:
+                continue
+            raw.setdefault(frac, {m: [] for m in METRICS})
+            for m in METRICS:
+                s_val = ssl_data[frac].get(m)
+                b_val = bl_data[frac].get(m)
+                if s_val is not None and b_val is not None:
+                    raw[frac][m].append(s_val - b_val)
+
+    result: Dict[float, Dict[str, Any]] = {}
+    for frac, metric_diffs in raw.items():
+        result[frac] = {}
+        for m, diffs in metric_diffs.items():
+            n = len(diffs)
+            if n == 0:
+                result[frac][m] = {
+                    "mean_diff": float("nan"), "std_diff": float("nan"),
+                    "ci95_half": float("nan"), "ci95_low": float("nan"),
+                    "ci95_high": float("nan"), "wins": 0, "n": 0, "diffs": [],
+                }
+                continue
+            mean_d = sum(diffs) / n
+            std_d  = _std(diffs) if n >= 2 else float("nan")
+            ci_h   = _ci95_half(diffs)  # nan when n<2
+            wins   = sum(1 for d in diffs if d > 0)
+            result[frac][m] = {
+                "mean_diff": mean_d,
+                "std_diff":  std_d,
+                "ci95_half": ci_h,
+                "ci95_low":  mean_d - ci_h if not math.isnan(ci_h) else float("nan"),
+                "ci95_high": mean_d + ci_h if not math.isnan(ci_h) else float("nan"),
+                "wins": wins,
+                "n":    n,
+                "diffs": diffs,
+            }
+    return result
+
+
+def print_paired_diff_table(
+    all_seed_results: Dict[int, Dict[str, Any]],
+    pairs: List[Dict[str, str]],
+) -> None:
+    """Wypisuje tabelę różnic sparowanych dla każdej pary (ssl, baseline)."""
+    import math
+
+    for pair in pairs:
+        ssl_name = pair["ssl"]
+        bl_name  = pair["baseline"]
+        diffs = paired_differences(all_seed_results, ssl_name, bl_name)
+        if not diffs:
+            continue
+        fracs = sorted(diffs.keys())
+        print(f"\n── Różnice sparowane: {ssl_name} − {bl_name} ──")
+        for m in METRICS:
+            header = f"  {m:<14}"
+            for frac in fracs:
+                d = diffs[frac][m]
+                if d["n"] == 0:
+                    header += f"  {'–':>14}"
+                elif math.isnan(d["ci95_half"]):
+                    header += f"  {d['mean_diff']:+.3f}(n={d['n']},CI=NaN)".ljust(16)
+                else:
+                    header += f"  {d['mean_diff']:+.3f}[±{d['ci95_half']:.3f}] {d['wins']}/{d['n']}".ljust(18)
+            print(header)
+
+
+# ===========================================================================
+# 3b. Test Wilcoxona vs baseline (opcjonalny — flaga --wilcoxon)
+# ===========================================================================
+
+def wilcoxon_vs_baseline(  # noqa: C901
     aggregated: Dict[str, Dict[float, Dict[str, float]]],
     baseline_name: str = "RandomInit",
     alpha: float = 0.05,
@@ -635,11 +735,13 @@ def print_results_table(
         print(row)
 
     print("=" * len(header))
+    has_wilcoxon = any(significance.get(a, {}) for a in algos)
     metric_label = {
         "acc": "accuracy", "f1": "macro_f1",
         "bac": "balanced_acc", "auc": "macro_auc",
     }.get(metric, metric)
-    print(f"  * = istotnie lepszy od RandomInit (Wilcoxon+Holm na {metric_label}, p < 0.05)")
+    if has_wilcoxon:
+        print(f"  * = istotnie lepszy od RandomInit (Wilcoxon+Holm na {metric_label}, p < 0.05)")
     print(f"  [±X.XXX] = 95% CI (t-Studenta)\n")
 
     frac_headers = " & ".join(
@@ -648,8 +750,11 @@ def print_results_table(
     print("% ── LaTeX ──────────────────────────────────────────────────")
     print(r"\begin{table}[ht]")
     print(r"\centering")
-    print(r"\caption{" + metric_name + r" (mean $\pm$ std) dla różnych frakcji etykiet. "
-          r"$^{*}$ = istotnie lepszy od RandomInit (Wilcoxon jednostronny, $p < 0.05$).}")
+    if has_wilcoxon:
+        print(r"\caption{" + metric_name + r" (mean $\pm$ 95\% CI) dla różnych frakcji etykiet. "
+              r"$^{*}$ = istotnie lepszy od RandomInit (Wilcoxon jednostronny, $p < 0.05$).}")
+    else:
+        print(r"\caption{" + metric_name + r" (mean $\pm$ 95\% CI) dla różnych frakcji etykiet.}")
     print(r"\begin{tabular}{l" + "c" * len(fracs) + "}")
     print(r"\hline")
     print(f"Algorytm & {frac_headers} \\\\")
@@ -705,8 +810,13 @@ def parse_args() -> argparse.Namespace:
                    help="Katalog zapisu figur (domyślnie: figures/)")
     p.add_argument("--run-finetune", action="store_true", default=False,
                    help="Dodatkowo przeprowadź fine-tuning end-to-end obok linear probe")
+    p.add_argument("--wilcoxon", action="store_true", default=False,
+                   help="Wykonaj test Wilcoxona vs baseline i dodaj gwiazdki istotności "
+                        "do tabel (wymaga min. 5 seedów). Domyślnie wyłączone — "
+                        "raportujemy różnice sparowane dla wszystkich metryk.")
     p.add_argument("--correction", choices=["holm", "bh"], default="holm",
-                   help="Korekcja wielokrotnych porównań: holm (FWER) lub bh (FDR).")
+                   help="Korekcja wielokrotnych porównań (używana tylko z --wilcoxon): "
+                        "holm (FWER) lub bh (FDR).")
     p.add_argument("--checkpoints-dir", default=None,
                    help="Katalog do zapisu wytrenowanych modeli (state_dict).")
     p.add_argument("--monitor-metrics", action="store_true", default=False,
@@ -905,21 +1015,28 @@ def main() -> None:
         for f in all_failures:
             print(f"  seed={f['seed']}  algo={f['algo']}  error={f['error']}")
 
-    aggregated   = aggregate(all_seed_results)
-    significance = wilcoxon_vs_baseline(
-        aggregated, baseline_name="RandomInit", correction=args.correction,
-    )
+    aggregated = aggregate(all_seed_results)
+
+    # Opcjonalny test Wilcoxona (flaga --wilcoxon)
+    empty_sig: Dict[str, Any] = {}
+    if getattr(args, "wilcoxon", False):
+        significance = wilcoxon_vs_baseline(
+            aggregated, baseline_name="RandomInit", correction=args.correction,
+        )
+        sig_bac = wilcoxon_vs_baseline(aggregated, baseline_name="RandomInit",
+                                       metric_key="bac_values",
+                                       correction=args.correction)
+        sig_auc = wilcoxon_vs_baseline(aggregated, baseline_name="RandomInit",
+                                       metric_key="auc_values",
+                                       correction=args.correction)
+    else:
+        significance = empty_sig
+        sig_bac = empty_sig
+        sig_auc = empty_sig
 
     print_results_table(aggregated, significance, metric="acc")
     print()
     print_results_table(aggregated, significance, metric="f1")
-
-    sig_bac = wilcoxon_vs_baseline(aggregated, baseline_name="RandomInit",
-                                   metric_key="bac_values",
-                                   correction=args.correction)
-    sig_auc = wilcoxon_vs_baseline(aggregated, baseline_name="RandomInit",
-                                   metric_key="auc_values",
-                                   correction=args.correction)
 
     has_bac = any(
         "bac_mean" in frac_data
@@ -937,6 +1054,15 @@ def main() -> None:
     if has_auc:
         print()
         print_results_table(aggregated, sig_auc, metric="auc")
+
+    # Różnice sparowane dla każdej pary SSL–baseline z DATASET_CONFIG
+    pairs = [
+        {"ssl": a["name"], "baseline": a["baseline"]}
+        for a in cfg["algorithms"]
+        if "baseline" in a
+    ]
+    if pairs:
+        print_paired_diff_table(all_seed_results, pairs)
 
 
 if __name__ == "__main__":

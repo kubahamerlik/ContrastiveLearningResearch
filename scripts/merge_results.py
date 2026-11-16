@@ -169,6 +169,8 @@ def main() -> None:
                    help="Plik wyjściowy (domyślnie: results_<dataset>.json z konfiguracji)")
     p.add_argument("--no-tables", action="store_true", default=False,
                    help="Pomiń wypisywanie tabel (tylko scal i zapisz)")
+    p.add_argument("--wilcoxon", action="store_true", default=False,
+                   help="Wykonaj test Wilcoxona vs baseline (tak jak --wilcoxon w run_experiments.py)")
     p.add_argument("--correction", choices=["holm", "bh"], default="holm")
     args = p.parse_args()
 
@@ -202,7 +204,10 @@ def main() -> None:
 
     # Odtwórz tabele i statystyki
     try:
-        from run_experiments import aggregate, wilcoxon_vs_baseline, print_results_table
+        from run_experiments import (
+            aggregate, wilcoxon_vs_baseline, print_results_table,
+            paired_differences, print_paired_diff_table, DATASET_CONFIG,
+        )
     except ImportError:
         print("\nUWAGA: nie można zaimportować run_experiments — pomijam tabele.")
         return
@@ -214,17 +219,23 @@ def main() -> None:
 
     aggregated = aggregate(all_seed_results)
     correction = args.correction
+    empty_sig: Dict[str, Any] = {}
 
-    significance = wilcoxon_vs_baseline(aggregated, baseline_name="RandomInit",
-                                        correction=correction)
+    if getattr(args, "wilcoxon", False):
+        significance = wilcoxon_vs_baseline(aggregated, baseline_name="RandomInit",
+                                            correction=correction)
+        sig_bac = wilcoxon_vs_baseline(aggregated, baseline_name="RandomInit",
+                                       metric_key="bac_values", correction=correction)
+        sig_auc = wilcoxon_vs_baseline(aggregated, baseline_name="RandomInit",
+                                       metric_key="auc_values", correction=correction)
+    else:
+        significance = empty_sig
+        sig_bac = empty_sig
+        sig_auc = empty_sig
+
     print_results_table(aggregated, significance, metric="acc")
     print()
     print_results_table(aggregated, significance, metric="f1")
-
-    sig_bac = wilcoxon_vs_baseline(aggregated, baseline_name="RandomInit",
-                                   metric_key="bac_values", correction=correction)
-    sig_auc = wilcoxon_vs_baseline(aggregated, baseline_name="RandomInit",
-                                   metric_key="auc_values", correction=correction)
 
     has_bac = any(
         "bac_mean" in fd
@@ -242,6 +253,17 @@ def main() -> None:
     if has_auc:
         print()
         print_results_table(aggregated, sig_auc, metric="auc")
+
+    # Różnice sparowane z konfiguracji datasetu
+    dataset_name = merged.get("config", {}).get("dataset")
+    if dataset_name and dataset_name in DATASET_CONFIG:
+        pairs = [
+            {"ssl": a["name"], "baseline": a["baseline"]}
+            for a in DATASET_CONFIG[dataset_name]["algorithms"]
+            if "baseline" in a
+        ]
+        if pairs:
+            print_paired_diff_table(all_seed_results, pairs)
 
 
 if __name__ == "__main__":
