@@ -494,6 +494,16 @@ class SubTabModel(BaseContrastiveModel):
         # dims: [hidden, ..., latent] enkodera
         dims: Optional[List[int]] = None,
     ) -> None:
+        import warnings
+        if num_features % n_subsets != 0:
+            skipped = num_features % n_subsets
+            warnings.warn(
+                f"SubTabModel: n_subsets={n_subsets} nie dzieli num_features={num_features} "
+                f"({skipped} kolumn na końcu nie będzie pokrytych przez żaden podzbiór). "
+                f"Użyj n_subsets będącego dzielnikiem {num_features}.",
+                UserWarning,
+                stacklevel=2,
+            )
         # Obliczamy subset_dim przed inicjalizacją BaseContrastiveModel
         n_col_subset = num_features // n_subsets
         n_overlap = int(overlap * n_col_subset)

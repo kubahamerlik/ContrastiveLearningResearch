@@ -31,6 +31,7 @@ def _suggest(
     trial: optuna.Trial,
     model_class: Type[BaseContrastiveModel],
     max_queue_size: int = 4096,
+    num_features: int = 0,
 ) -> Dict[str, Any]:
     """Zwraca słownik hiperparametrów zaproponowanych przez Optunę."""
     base = {
@@ -47,7 +48,15 @@ def _suggest(
         base["temperature"]     = trial.suggest_float("temperature",     0.1, 1.0)
 
     elif name in ("SubTabModel", "RandomInitSubTabArchModel"):
-        base["n_subsets"]     = trial.suggest_int("n_subsets", 2, 8)
+        # n_subsets musi być dzielnikiem num_features, żeby żadne kolumny nie były pomijane.
+        # Dla Credit Card (30 cech): dozwolone {2, 3, 5, 6}.
+        if num_features > 0:
+            candidates = [d for d in range(2, 9) if num_features % d == 0]
+            if not candidates:
+                candidates = [2]
+            base["n_subsets"] = trial.suggest_categorical("n_subsets", candidates)
+        else:
+            base["n_subsets"] = trial.suggest_int("n_subsets", 2, 8)
         base["overlap"]       = trial.suggest_float("overlap", 0.0, 0.9)
         base["masking_ratio"] = trial.suggest_float("masking_ratio", 0.1, 0.5)
         base["noise_type"]    = trial.suggest_categorical(
@@ -93,7 +102,11 @@ def _objective(
     except Exception:
         n_train = 4096 * 4
     max_q = max(64, n_train // 4)
-    hp = _suggest(trial, model_class, max_queue_size=max_q)
+    hp = _suggest(
+        trial, model_class,
+        max_queue_size=max_q,
+        num_features=fixed_model_kwargs.get("num_features", 0),
+    )
 
     model_kwargs = filter_model_kwargs(model_class, {
         **fixed_model_kwargs,

@@ -569,3 +569,65 @@ class TestAEWrapperDims:
         assert decoder_out == subset_dim, (
             f"Oczekiwano subset_dim={subset_dim}, dostałem {decoder_out}"
         )
+
+
+# ===========================================================================
+# Testy HPO — n_subsets musi być dzielnikiem num_features
+# ===========================================================================
+
+class TestSubTabHPO:
+    """
+    n_subsets sugerowane przez HPO muszą być dzielnikami num_features.
+    Dla Credit Card (30 cech): 3, 5, 6 są dzielnikami; 4, 7 nie są.
+    Niedzielnicy powodują, że ostatnie kolumny (reszta z dzielenia) nigdy
+    nie trafiają do żadnego podzbioru.
+    """
+
+    def test_hpo_n_subsets_are_divisors(self):
+        """
+        _get_subtab_hpo_space zwraca wyłącznie n_subsets będące dzielnikami
+        num_features, lub HPO suggest_categorical używa tylko dzielników.
+        """
+        import optuna
+        from contrastive_framework.hpo import _suggest
+        from contrastive_framework.models.tabular_models import SubTabModel
+
+        num_features = 30
+        divisors_of_30 = {d for d in range(2, 9) if num_features % d == 0}
+        # {2, 3, 5, 6}
+
+        suggested = set()
+        for seed in range(20):
+            study = optuna.create_study(
+                sampler=optuna.samplers.RandomSampler(seed=seed)
+            )
+
+            def objective(trial):
+                params = _suggest(trial, SubTabModel, num_features=num_features)
+                suggested.add(params["n_subsets"])
+                return 0.0
+
+            study.optimize(objective, n_trials=1, show_progress_bar=False)
+
+        non_divisors = suggested - divisors_of_30
+        assert not non_divisors, (
+            f"HPO zaproponowało n_subsets nie będące dzielnikami {num_features}: "
+            f"{non_divisors}. Dozwolone: {divisors_of_30}."
+        )
+
+    def test_subtab_init_warns_missing_columns(self):
+        """
+        SubTabModel.__init__ emituje ostrzeżenie gdy n_subsets nie dzieli num_features
+        (kolumny na końcu są pomijane przez podzbiory).
+        """
+        import warnings
+        with warnings.catch_warnings(record=True) as w:
+            warnings.simplefilter("always")
+            SubTabModel(num_features=30, n_subsets=4)  # 30 % 4 == 2 → ostrzeżenie
+
+        messages = [str(warning.message) for warning in w]
+        assert any("kolumn" in m.lower() or "pokryt" in m.lower() or "subset" in m.lower()
+                   for m in messages), (
+            f"Brak ostrzeżenia dla n_subsets=4, num_features=30 (2 kolumny pominięte). "
+            f"Otrzymane ostrzeżenia: {messages}"
+        )
